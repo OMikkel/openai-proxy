@@ -13,6 +13,15 @@ const LOG_PATH = path.join(__dirname, 'access.log');
 const DB_PATH = path.join(__dirname, 'usage.sqlite');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
+// Ensure keys.json exists
+if (!fs.existsSync(KEYS_PATH)) {
+  fs.writeFileSync(KEYS_PATH, JSON.stringify([
+    { key: "user-api-key-1", name: "Alice", email: "alice@example.com" },
+    { key: "user-api-key-2", name: "Bob", email: "bob@example.com" }
+  ], null, 2));
+  console.log('✅ Created default keys.json');
+}
+
 const OPENAI_HOST = 'api.openai.com';
 let OPENAI_API_KEY = 'sk-...';
 
