@@ -99,7 +99,25 @@ app.use((req, res, next) => {
 app.use((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const userKey = req.headers['api-key'];
+  // Robustly extract API key from headers (case-insensitive, trim, support common variants)
+  function getApiKeyFromHeaders(headers) {
+    // Try common header names, case-insensitive
+    const possibleNames = ['api-key', 'x-api-key', 'apikey', 'authorization'];
+    for (const name of possibleNames) {
+      if (headers[name]) return headers[name].trim();
+      // Try all-lowercase
+      if (headers[name.toLowerCase()]) return headers[name.toLowerCase()].trim();
+      // Try all-uppercase
+      if (headers[name.toUpperCase()]) return headers[name.toUpperCase()].trim();
+      // Try capitalized
+      const cap = name.charAt(0).toUpperCase() + name.slice(1);
+      if (headers[cap]) return headers[cap].trim();
+    }
+    return '';
+  }
+
+  const userKey = getApiKeyFromHeaders(req.headers);
+  console.log('[DEBUG] Received API key:', userKey);
   const user = VALID_KEYS.get(userKey);
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const timestamp = new Date().toISOString();
