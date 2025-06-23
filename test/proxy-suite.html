@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OpenAI Proxy Test Suite</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; }
+    label, input, textarea, button, select { display: block; margin: 0.5em 0; }
+    textarea { width: 100%; height: 80px; }
+    pre { background: #f4f4f4; padding: 1em; }
+    .test-block { border: 1px solid #ccc; padding: 1em; margin-bottom: 2em; }
+    img { max-width: 200px; display: block; margin: 0.5em 0; }
+  </style>
+</head>
+<body>
+  <h1>OpenAI Proxy Test Suite</h1>
+  <label>API Key: <input type="text" id="apiKey" required></label>
+  <button onclick="localStorage.removeItem('proxyApiKey');location.reload();">Clear Saved API Key</button>
+
+  <div class="test-block">
+    <h2>Chat Completion Test</h2>
+    <form id="chatTest">
+      <label>Prompt:<br><textarea id="chatPrompt">What is the capital of France?</textarea></label>
+      <button type="submit">Send</button>
+    </form>
+    <pre id="chatResponse"></pre>
+  </div>
+
+  <div class="test-block">
+    <h2>Multimodal (Vision) Test</h2>
+    <form id="visionTest">
+      <label>Prompt:<br><textarea id="visionPrompt">What is in this image?</textarea></label>
+      <label>Image:<br><img id="testImg" src="image.png" alt="Test Image"></label>
+      <button type="submit">Send</button>
+    </form>
+    <pre id="visionResponse"></pre>
+  </div>
+
+  <script>
+    // Save/load API key
+    window.addEventListener('DOMContentLoaded', () => {
+      const savedKey = localStorage.getItem('proxyApiKey');
+      if (savedKey) document.getElementById('apiKey').value = savedKey;
+      document.getElementById('apiKey').addEventListener('change', e => {
+        localStorage.setItem('proxyApiKey', e.target.value.trim());
+      });
+    });
+    function getApiKey() {
+      return document.getElementById('apiKey').value.trim();
+    }
+    // Chat Completion
+    document.getElementById('chatTest').onsubmit = async function(e) {
+      e.preventDefault();
+      const apiKey = getApiKey();
+      localStorage.setItem('proxyApiKey', apiKey);
+      const prompt = document.getElementById('chatPrompt').value;
+      const responseBox = document.getElementById('chatResponse');
+      responseBox.textContent = 'Loading...';
+      try {
+        const res = await fetch('http://localhost:8080/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Api-Key': apiKey
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 64
+          })
+        });
+        const text = await res.text();
+        try { responseBox.textContent = JSON.stringify(JSON.parse(text), null, 2); }
+        catch { responseBox.textContent = text; }
+      } catch (err) {
+        responseBox.textContent = 'Error: ' + err;
+      }
+    };
+    // Vision (Multimodal)
+    document.getElementById('visionTest').onsubmit = async function(e) {
+      e.preventDefault();
+      const apiKey = getApiKey();
+      localStorage.setItem('proxyApiKey', apiKey);
+      const prompt = document.getElementById('visionPrompt').value;
+      const responseBox = document.getElementById('visionResponse');
+      responseBox.textContent = 'Loading...';
+      // Load image as base64
+      const img = document.getElementById('testImg');
+      const imgBlob = await fetch(img.src).then(r => r.blob());
+      const imgBase64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(imgBlob);
+      });
+      try {
+        const res = await fetch('http://localhost:8080/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Api-Key': apiKey
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o',
+            messages: [
+              { role: 'user', content: [
+                { type: 'text', text: prompt },
+                { type: 'image_url', image_url: { "url": `data:image/jpeg;base64,${imgBase64}` } }
+              ]}
+            ],
+            max_tokens: 64
+          })
+        });
+        const text = await res.text();
+        try { responseBox.textContent = JSON.stringify(JSON.parse(text), null, 2); }
+        catch { responseBox.textContent = text; }
+      } catch (err) {
+        responseBox.textContent = 'Error: ' + err;
+      }
+    };
+  </script>
+</body>
+</html>

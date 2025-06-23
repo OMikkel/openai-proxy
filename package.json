@@ -1,0 +1,24 @@
+{
+  "name": "openai-proxy",
+  "version": "0.0.1",
+  "description": "Simple proxy for controlling access to openai with own API keys",
+  "homepage": "https://github.com/cklokmose/openai-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/cklokmose/openai-proxy/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cklokmose/openai-proxy.git"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "sqlite3": "^5.1.7"
+  },
+  "license": "MIT",
+  "author": "Clemens Nylandsted Klokmose",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}

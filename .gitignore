@@ -1,0 +1,6 @@
+# Ignore sensitive and environment-specific files
+config.json
+usage.sqlite
+access.log
+keys.json
+node_modules/

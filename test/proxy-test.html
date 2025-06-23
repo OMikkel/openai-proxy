@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>OpenAI Proxy Test</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; }
+    label, input, textarea, button { display: block; margin: 0.5em 0; }
+    textarea { width: 100%; height: 100px; }
+    pre { background: #f4f4f4; padding: 1em; }
+  </style>
+</head>
+<body>
+  <h1>Test OpenAI Proxy</h1>
+  <form id="proxyForm">
+    <label>API Key: <input type="text" id="apiKey" required></label>
+    <label>Prompt:<br><textarea id="prompt" required>Say hello to the world!</textarea></label>
+    <button type="submit">Send</button>
+  </form>
+  <h2>Response</h2>
+  <pre id="response"></pre>
+  <script>
+    // Load API key from localStorage if available
+    window.addEventListener('DOMContentLoaded', () => {
+      const savedKey = localStorage.getItem('proxyApiKey');
+      if (savedKey) {
+        document.getElementById('apiKey').value = savedKey;
+      }
+    });
+    document.getElementById('proxyForm').onsubmit = async function(e) {
+      e.preventDefault();
+      const apiKey = document.getElementById('apiKey').value.trim();
+      // Save API key to localStorage
+      localStorage.setItem('proxyApiKey', apiKey);
+      const prompt = document.getElementById('prompt').value;
+      const responseBox = document.getElementById('response');
+      responseBox.textContent = 'Loading...';
+      console.log('Submitting to proxy:', {
+        url: 'http://localhost:8080/v1/chat/completions',
+        apiKey,
+        prompt
+      });
+      try {
+        const res = await fetch('http://localhost:8080/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Api-Key': apiKey
+          },
+          body: JSON.stringify({
+            model: 'gpt-3.5-turbo',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 64
+          })
+        });
+        console.log('Fetch response status:', res.status);
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (jsonErr) {
+          console.error('Failed to parse JSON:', jsonErr, 'Raw response:', text);
+          responseBox.textContent = 'Non-JSON response: ' + text;
+          return;
+        }
+        responseBox.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        console.error('Fetch error:', err);
+        responseBox.textContent = 'Error: ' + err;
+      }
+    };
+  </script>
+</body>
+</html>
