@@ -200,27 +200,35 @@ app.use((req, res) => {
       console.log(`[DEBUG] Received data chunk from OpenAI (${chunk.length} bytes)`);
     });
     proxyRes.on('end', () => {
-      const raw = Buffer.concat(responseChunks).toString();
-      console.log(`[DEBUG] Full response from OpenAI:`, raw);
-      try {
-        const json = JSON.parse(raw);
-        const usage = json.usage || {};
-        const model = json.model || 'unknown';
-        const prompt = usage.prompt_tokens || 0;
-        const completion = usage.completion_tokens || 0;
-        const total = prompt + completion;
+      const buffer = Buffer.concat(responseChunks);
+      const contentType = proxyRes.headers['content-type'] || '';
+      if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
+        // Handle as text/JSON
+        const raw = buffer.toString();
+        console.log(`[DEBUG] Full response from OpenAI:`, raw);
+        try {
+          const json = JSON.parse(raw);
+          const usage = json.usage || {};
+          const model = json.model || 'unknown';
+          const prompt = usage.prompt_tokens || 0;
+          const completion = usage.completion_tokens || 0;
+          const total = prompt + completion;
 
-        const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
-        console.log(usageLine);
-        fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
+          const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
+          console.log(usageLine);
+          fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
 
-        logToDB(userKey, model, req.url, prompt, completion);
+          logToDB(userKey, model, req.url, prompt, completion);
+        } catch (err) {
+          console.error('⚠️ Failed to parse OpenAI response:', err.message);
+        }
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         res.end(raw);
-      } catch (err) {
-        console.error('⚠️ Failed to parse OpenAI response:', err.message);
+      } else {
+        // Binary data: forward as-is
+        console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${buffer.length}`);
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        res.end(raw);
+        res.end(buffer);
       }
     });
   });
