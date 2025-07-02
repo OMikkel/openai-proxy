@@ -91,15 +91,7 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 - `usage.sqlite` — Usage database (gitignored)
 - `access.log` — Access log (gitignored)
 
-## Acknowledgement
-
-This proxy was developed with the assistance of AI (GitHub Copilot, GPT-4.1).
-
-## License
-
-MIT
-
-## 🚀 Production Scaling & Cleanup
+## Scaling & Cleanup
 
 The proxy is designed to handle high-volume usage (e.g., 150 students uploading hundreds of audio files) with built-in scaling and cleanup mechanisms:
 
@@ -135,3 +127,11 @@ ls -lh access.log*
 # Monitor active uploads (server logs)
 # Look for rate limiting messages in console
 ```
+
+## Acknowledgement
+
+This proxy was developed with the assistance of AI (GitHub Copilot, GPT-4.1).
+
+## License
+
+MIT
