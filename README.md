@@ -98,3 +98,40 @@ This proxy was developed with the assistance of AI (GitHub Copilot, GPT-4.1).
 ## License
 
 MIT
+
+## 🚀 Production Scaling & Cleanup
+
+The proxy is designed to handle high-volume usage (e.g., 150 students uploading hundreds of audio files) with built-in scaling and cleanup mechanisms:
+
+### **Automatic File Cleanup**
+- **Temporary Storage**: Audio uploads use disk storage (not RAM) in `temp-uploads/` directory
+- **Automatic Cleanup**: Temp files are deleted immediately after processing
+- **Scheduled Cleanup**: Every 5 minutes, removes any orphaned files older than 10 minutes
+- **Graceful Shutdown**: Cleans up all temp files when server stops
+
+### **Rate Limiting**
+- **Upload Limits**: Max 10 concurrent uploads per user (prevents resource exhaustion)
+- **File Limits**: Max 5 files per request, 50MB per file
+- **File Type Validation**: Only allows audio formats for audio endpoints
+
+### **Log Management**
+- **Log Rotation**: Automatically rotates `access.log` when it exceeds 100MB
+- **Backup Retention**: Keeps last 5 log backups, automatically deletes older ones
+- **Memory Efficient**: Logs are written to disk, not stored in memory
+
+### **Memory Management**
+- **Disk Storage**: Files are written to disk instead of RAM
+- **Immediate Cleanup**: Files removed as soon as request completes (success or failure)
+- **Error Handling**: Cleanup occurs even on timeouts, errors, or interruptions
+
+### **Resource Monitoring**
+```bash
+# Monitor temp files
+ls -la temp-uploads/
+
+# Monitor log size
+ls -lh access.log*
+
+# Monitor active uploads (server logs)
+# Look for rate limiting messages in console
+```

@@ -2,5 +2,9 @@
 config.json
 usage.sqlite
 access.log
+access.log.*.bak
 keys.json
 node_modules/
+temp-uploads/
+package-lock.json
+.DS_Store

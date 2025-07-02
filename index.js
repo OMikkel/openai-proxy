@@ -4,6 +4,7 @@ import express from 'express';
 import path from 'path';
 import sqlite3 from 'sqlite3';
 import { fileURLToPath } from 'url';
+import multer from 'multer';
 
 // --- Path setup and config file locations ---
 const __filename = fileURLToPath(import.meta.url);
@@ -89,6 +90,44 @@ fs.watchFile(KEYS_PATH, { interval: 1000 }, () => {
 const app = express();
 app.use(express.json({ limit: '50mb' })); // Large payloads for images
 
+// Add multer for handling multipart/form-data with temporary disk storage
+const upload = multer({ 
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const tempDir = path.join(__dirname, 'temp-uploads');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      cb(null, tempDir);
+    },
+    filename: (req, file, cb) => {
+      // Create unique filename with timestamp and random string
+      const uniqueName = `${Date.now()}-${Math.random().toString(36).substring(2)}-${file.originalname}`;
+      cb(null, uniqueName);
+    }
+  }),
+  limits: { 
+    fileSize: 50 * 1024 * 1024, // 50MB per file
+    files: 5 // Max 5 files per request
+  },
+  fileFilter: (req, file, cb) => {
+    // Only allow audio files for audio endpoints
+    if (req.url.includes('/audio/')) {
+      const allowedMimes = [
+        'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/m4a', 
+        'audio/flac', 'audio/ogg', 'audio/webm'
+      ];
+      if (allowedMimes.includes(file.mimetype)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Unsupported audio format: ${file.mimetype}`));
+      }
+    } else {
+      cb(null, true);
+    }
+  }
+});
+
 // --- CORS and preflight handling ---
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
@@ -137,6 +176,37 @@ app.use((req, res) => {
     return res.status(403).json({ error: 'Invalid or missing API key' });
   }
 
+  // Handle multipart/form-data for audio endpoints
+  const isMultipartEndpoint = req.url.includes('/audio/') && 
+    req.headers['content-type']?.startsWith('multipart/form-data');
+
+  if (isMultipartEndpoint) {
+    // Check rate limit for uploads
+    if (!checkUploadRateLimit(userKey)) {
+      const line = `[${timestamp}] ⚠️ Rate limit exceeded for ${user.name} from ${ip} → ${req.method} ${req.url}`;
+      console.warn(line);
+      fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
+      return res.status(429).json({ error: 'Too many concurrent uploads. Please wait and try again.' });
+    }
+    
+    // Use multer to parse multipart data
+    upload.any()(req, res, (err) => {
+      // Always release the upload slot
+      releaseUploadSlot(userKey);
+      
+      if (err) {
+        console.error('Multer error:', err);
+        return res.status(400).json({ error: `Failed to parse multipart data: ${err.message}` });
+      }
+      handleMultipartRequest(req, res, user, userKey, timestamp, ip);
+    });
+  } else {
+    handleJsonRequest(req, res, user, userKey, timestamp, ip);
+  }
+
+});
+
+function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
   // Utility: Redact base64 image data in request body for logging, but log a short prefix for traceability
   function redactBase64Images(obj) {
     if (Array.isArray(obj)) {
@@ -248,6 +318,247 @@ app.use((req, res) => {
 
   proxyReq.write(bodyBuffer);
   proxyReq.end();
+}
+
+function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
+  const uploadedFiles = req.files || [];
+  
+  // Cleanup function to remove temporary files
+  const cleanupFiles = () => {
+    for (const file of uploadedFiles) {
+      try {
+        if (fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+          console.log(`🧹 Cleaned up temp file: ${file.filename}`);
+        }
+      } catch (err) {
+        console.warn(`⚠️ Failed to cleanup ${file.filename}:`, err.message);
+      }
+    }
+  };
+  
+  console.log(`[DEBUG] Handling multipart request for audio endpoint`);
+  console.log(`[DEBUG] Form fields:`, req.body);
+  console.log(`[DEBUG] Files:`, uploadedFiles.map(f => ({ 
+    fieldname: f.fieldname, 
+    filename: f.filename,
+    originalname: f.originalname,
+    size: f.size, 
+    mimetype: f.mimetype 
+  })));
+
+  // Reconstruct multipart form data
+  const boundary = '----formdata-openai-proxy-' + Math.random().toString(36);
+  let formData = '';
+  
+  try {
+    // Add form fields
+    for (const [key, value] of Object.entries(req.body || {})) {
+      formData += `--${boundary}\r\n`;
+      formData += `Content-Disposition: form-data; name="${key}"\r\n\r\n`;
+      formData += `${value}\r\n`;
+    }
+    
+    // Add files - read from disk instead of memory
+    for (const file of uploadedFiles) {
+      formData += `--${boundary}\r\n`;
+      formData += `Content-Disposition: form-data; name="${file.fieldname}"; filename="${file.originalname || 'audio.wav'}"\r\n`;
+      formData += `Content-Type: ${file.mimetype || 'audio/wav'}\r\n\r\n`;
+      
+      // Read file from disk
+      const fileBuffer = fs.readFileSync(file.path);
+      formData += fileBuffer.toString('binary') + '\r\n';
+    }
+    
+    formData += `--${boundary}--\r\n`;
+    
+    const bodyBuffer = Buffer.from(formData, 'binary');
+    
+    // Log request (without file data)
+    const logData = { ...req.body, files: uploadedFiles.map(f => ({ name: f.fieldname, size: f.size })) };
+    const logLine = `[${timestamp}] ✅ ${user.name} <${user.email}> from ${ip} → ${req.method} ${req.url} | multipart: ${JSON.stringify(logData)}`;
+    fs.writeFileSync(LOG_PATH, logLine + '\n', { flag: 'a' });
+
+    console.log(`[DEBUG] Forwarding multipart request to OpenAI: https://${OPENAI_HOST}${req.url}`);
+    const proxyReq = https.request({
+      hostname: OPENAI_HOST,
+      path: req.url,
+      method: req.method,
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': Buffer.byteLength(bodyBuffer)
+      },
+      timeout: 30000, // Longer timeout for audio processing
+      family: 4
+    }, proxyRes => {
+      const responseChunks = [];
+      console.log(`[DEBUG] OpenAI responded with status: ${proxyRes.statusCode}`);
+      proxyRes.on('data', chunk => {
+        responseChunks.push(chunk);
+        console.log(`[DEBUG] Received data chunk from OpenAI (${chunk.length} bytes)`);
+      });
+      proxyRes.on('end', () => {
+        // Cleanup temp files after successful response
+        cleanupFiles();
+        
+        const buffer = Buffer.concat(responseChunks);
+        const contentType = proxyRes.headers['content-type'] || '';
+        if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
+          // Handle as text/JSON
+          const raw = buffer.toString();
+          console.log(`[DEBUG] Full response from OpenAI:`, raw);
+          try {
+            const json = JSON.parse(raw);
+            // Audio endpoints may not have usage data, but log if available
+            const usage = json.usage || {};
+            const model = req.body?.model || 'unknown';
+            const prompt = usage.prompt_tokens || 0;
+            const completion = usage.completion_tokens || 0;
+            const total = prompt + completion;
+
+            if (total > 0) {
+              const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
+              console.log(usageLine);
+              fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
+              logToDB(userKey, model, req.url, prompt, completion);
+            }
+          } catch (err) {
+            console.error('⚠️ Failed to parse OpenAI response:', err.message);
+          }
+          res.writeHead(proxyRes.statusCode, proxyRes.headers);
+          res.end(raw);
+        } else {
+          // Binary data: forward as-is
+          console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${buffer.length}`);
+          res.writeHead(proxyRes.statusCode, proxyRes.headers);
+          res.end(buffer);
+        }
+      });
+    });
+
+    proxyReq.on('timeout', () => {
+      console.error('⏰ OpenAI request timed out after 30 seconds');
+      cleanupFiles(); // Cleanup on timeout
+      proxyReq.destroy();
+      res.statusCode = 504;
+      res.end('OpenAI request timed out');
+    });
+
+    proxyReq.on('error', err => {
+      console.error('💥 Proxy error:', err.message);
+      cleanupFiles(); // Cleanup on error
+      res.statusCode = 502;
+      res.end('Bad Gateway');
+    });
+
+    proxyReq.write(bodyBuffer);
+    proxyReq.end();
+    
+  } catch (err) {
+    console.error('💥 Error processing multipart request:', err.message);
+    cleanupFiles(); // Cleanup on processing error
+    res.status(500).json({ error: 'Internal server error processing upload' });
+  }
+}
+
+// --- Cleanup and rate limiting ---
+let activeUploads = new Map(); // Track active uploads per user
+const UPLOAD_RATE_LIMIT = 10; // Max 10 concurrent uploads per user
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // Cleanup every 5 minutes
+const TEMP_FILE_MAX_AGE = 10 * 60 * 1000; // Delete temp files after 10 minutes
+
+// Cleanup temporary files periodically
+function cleanupTempFiles() {
+  const tempDir = path.join(__dirname, 'temp-uploads');
+  if (!fs.existsSync(tempDir)) return;
+  
+  const now = Date.now();
+  const files = fs.readdirSync(tempDir);
+  let cleaned = 0;
+  
+  for (const file of files) {
+    const filePath = path.join(tempDir, file);
+    try {
+      const stats = fs.statSync(filePath);
+      const age = now - stats.mtime.getTime();
+      
+      if (age > TEMP_FILE_MAX_AGE) {
+        fs.unlinkSync(filePath);
+        cleaned++;
+        console.log(`🧹 Cleaned up old temp file: ${file}`);
+      }
+    } catch (err) {
+      console.warn(`⚠️ Failed to cleanup ${file}:`, err.message);
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Cleanup complete: removed ${cleaned} temporary files`);
+  }
+}
+
+// Log rotation to prevent access.log from growing too large
+function rotateLogs() {
+  const maxLogSize = 100 * 1024 * 1024; // 100MB
+  
+  try {
+    const stats = fs.statSync(LOG_PATH);
+    if (stats.size > maxLogSize) {
+      const backupPath = `${LOG_PATH}.${Date.now()}.bak`;
+      fs.renameSync(LOG_PATH, backupPath);
+      console.log(`📋 Rotated access log to ${backupPath}`);
+      
+      // Keep only last 5 backup files
+      const backupFiles = fs.readdirSync(__dirname)
+        .filter(f => f.startsWith('access.log.') && f.endsWith('.bak'))
+        .sort()
+        .reverse();
+        
+      if (backupFiles.length > 5) {
+        for (const file of backupFiles.slice(5)) {
+          fs.unlinkSync(path.join(__dirname, file));
+          console.log(`🗑️ Deleted old log backup: ${file}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('⚠️ Log rotation failed:', err.message);
+  }
+}
+
+// Rate limiting check
+function checkUploadRateLimit(userKey) {
+  const currentUploads = activeUploads.get(userKey) || 0;
+  if (currentUploads >= UPLOAD_RATE_LIMIT) {
+    return false;
+  }
+  activeUploads.set(userKey, currentUploads + 1);
+  return true;
+}
+
+function releaseUploadSlot(userKey) {
+  const currentUploads = activeUploads.get(userKey) || 0;
+  if (currentUploads > 0) {
+    activeUploads.set(userKey, currentUploads - 1);
+  }
+}
+
+// Start cleanup intervals
+setInterval(cleanupTempFiles, CLEANUP_INTERVAL);
+setInterval(rotateLogs, CLEANUP_INTERVAL);
+
+// Cleanup on shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down server...');
+  cleanupTempFiles();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 Server terminated...');
+  cleanupTempFiles();
+  process.exit(0);
 });
 
 app.listen(8080, () => {

@@ -4,11 +4,24 @@
 import fs from 'fs';
 import http from 'http';
 
-const API_KEY = 'test-api-key-123'; // Using the actual key from keys.json
-const PROXY_URL = 'localhost';
-const PROXY_PORT = 8080;
+// Default values
+let host = 'localhost:8080';
+let apiKey = 'test-api-key-123'; // Default key
 
-console.log('🎵 Testing binary response with OpenAI TTS API...');
+// Parse command-line arguments
+// Usage: node test-binary.js --host=localhost:8080 --api-key=your-key
+process.argv.slice(2).forEach(arg => {
+  if (arg.startsWith('--host=')) {
+    host = arg.substring('--host='.length);
+  } else if (arg.startsWith('--api-key=')) {
+    apiKey = arg.substring('--api-key='.length);
+  }
+});
+
+const [hostname, portStr] = host.split(':');
+const port = portStr ? parseInt(portStr, 10) : 8080;
+
+console.log(`🎵 Testing binary response with OpenAI TTS API via http://${hostname}:${port}...`);
 
 const requestBody = JSON.stringify({
   model: 'tts-1',
@@ -17,13 +30,13 @@ const requestBody = JSON.stringify({
 });
 
 const options = {
-  hostname: PROXY_URL,
-  port: PROXY_PORT,
+  hostname: hostname,
+  port: port,
   path: '/v1/audio/speech',
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
-    'Api-Key': API_KEY,
+    'Api-Key': apiKey,
     'Content-Length': Buffer.byteLength(requestBody)
   }
 };

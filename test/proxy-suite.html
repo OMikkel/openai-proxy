@@ -7,15 +7,39 @@
     body { font-family: sans-serif; margin: 2em; }
     label, input, textarea, button, select { display: block; margin: 0.5em 0; }
     textarea { width: 100%; height: 80px; }
-    pre { background: #f4f4f4; padding: 1em; }
+    pre { background: #f4f4f4; padding: 1em; max-height: 400px; overflow-y: auto; }
     .test-block { border: 1px solid #ccc; padding: 1em; margin-bottom: 2em; }
+    .config-section { background-color: #f5f5f5; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+    input[type="text"], input[type="url"] { width: 300px; }
+    button { background: #007cba; color: white; border: none; padding: 10px 15px; cursor: pointer; border-radius: 3px; }
+    button:hover { background: #005a87; }
+    .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+    .status-online { background-color: #28a745; }
+    .status-offline { background-color: #dc3545; }
     img { max-width: 200px; display: block; margin: 0.5em 0; }
   </style>
 </head>
 <body>
   <h1>OpenAI Proxy Test Suite</h1>
-  <label>API Key: <input type="text" id="apiKey" required></label>
-  <button onclick="localStorage.removeItem('proxyApiKey');location.reload();">Clear Saved API Key</button>
+  
+  <!-- Configuration Section -->
+  <div class="config-section">
+    <h3>🔧 Configuration</h3>
+    <div>
+      <label for="hostUrl">Proxy Host:</label>
+      <input type="url" id="hostUrl" placeholder="http://localhost:8080" value="http://localhost:8080">
+      <span id="hostStatus" class="status-indicator status-offline" title="Connection status"></span>
+    </div>
+    <div>
+      <label for="apiKey">API Key:</label>
+      <input type="text" id="apiKey" placeholder="Enter your API key" required>
+      <button onclick="testConnection()">Test Connection</button>
+      <button onclick="clearConfig()">Clear Saved Settings</button>
+    </div>
+    <div>
+      <small>💾 Settings are automatically saved to localStorage</small>
+    </div>
+  </div>
 
   <div class="test-block">
     <h2>Chat Completion Test</h2>
@@ -37,31 +61,122 @@
   </div>
 
   <script>
+    // Configuration management
+    function loadConfig() {
+      const savedHost = localStorage.getItem('proxyHost');
+      const savedKey = localStorage.getItem('proxyApiKey');
+      
+      if (savedHost) {
+        document.getElementById('hostUrl').value = savedHost;
+      }
+      if (savedKey) {
+        document.getElementById('apiKey').value = savedKey;
+      }
+    }
+
+    function saveConfig() {
+      const host = document.getElementById('hostUrl').value.trim();
+      const key = document.getElementById('apiKey').value.trim();
+      
+      localStorage.setItem('proxyHost', host);
+      localStorage.setItem('proxyApiKey', key);
+    }
+
+    function getConfig() {
+      let host = document.getElementById('hostUrl').value.trim() || 'http://localhost:8080';
+      const key = document.getElementById('apiKey').value.trim();
+      
+      // Remove trailing slashes and /v1 if present
+      host = host.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+
+      return { host, key };
+    }
+
+    function clearConfig() {
+      localStorage.removeItem('proxyHost');
+      localStorage.removeItem('proxyApiKey');
+      document.getElementById('hostUrl').value = 'http://localhost:8080';
+      document.getElementById('apiKey').value = '';
+      location.reload();
+    }
+
+    // Connection testing
+    async function testConnection() {
+      const { host, key } = getConfig();
+      const statusIndicator = document.getElementById('hostStatus');
+      
+      if (!key) {
+        alert('Please enter an API key first');
+        return;
+      }
+      
+      try {
+        statusIndicator.className = 'status-indicator status-offline';
+        statusIndicator.title = 'Testing connection...';
+        
+        const response = await fetch(`${host}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Api-Key': key
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: 'test' }],
+            max_tokens: 5
+          })
+        });
+        
+        if (response.ok || response.status === 400) { // 400 is ok, means server is responding
+          statusIndicator.className = 'status-indicator status-online';
+          statusIndicator.title = 'Connection successful';
+          alert('✅ Connection successful!');
+        } else if (response.status === 403) {
+          statusIndicator.className = 'status-indicator status-offline';
+          statusIndicator.title = 'Invalid API key';
+          alert('❌ Invalid API key');
+        } else {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      } catch (error) {
+        statusIndicator.className = 'status-indicator status-offline';
+        statusIndicator.title = 'Connection failed';
+        alert('❌ Connection failed: ' + error.message);
+      }
+    }
+
+    // Auto-save config on changes
+    document.getElementById('hostUrl').addEventListener('input', saveConfig);
+    document.getElementById('apiKey').addEventListener('change', saveConfig);
+
     // Save/load API key
     window.addEventListener('DOMContentLoaded', () => {
-      const savedKey = localStorage.getItem('proxyApiKey');
-      if (savedKey) document.getElementById('apiKey').value = savedKey;
-      document.getElementById('apiKey').addEventListener('change', e => {
-        localStorage.setItem('proxyApiKey', e.target.value.trim());
-      });
+      loadConfig();
     });
+
     function getApiKey() {
       return document.getElementById('apiKey').value.trim();
     }
     // Chat Completion
     document.getElementById('chatTest').onsubmit = async function(e) {
       e.preventDefault();
-      const apiKey = getApiKey();
-      localStorage.setItem('proxyApiKey', apiKey);
+      const { host, key } = getConfig();
+      saveConfig();
+      
+      if (!key) {
+        alert('Please enter an API key first');
+        return;
+      }
+      
       const prompt = document.getElementById('chatPrompt').value;
       const responseBox = document.getElementById('chatResponse');
       responseBox.textContent = 'Loading...';
       try {
-        const res = await fetch('http://localhost:8080/v1/chat/completions', {
+        const res = await fetch(`${host}/v1/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Api-Key': apiKey
+            'Api-Key': key
           },
           body: JSON.stringify({
             model: 'gpt-4o',
@@ -79,8 +194,14 @@
     // Vision (Multimodal)
     document.getElementById('visionTest').onsubmit = async function(e) {
       e.preventDefault();
-      const apiKey = getApiKey();
-      localStorage.setItem('proxyApiKey', apiKey);
+      const { host, key } = getConfig();
+      saveConfig();
+      
+      if (!key) {
+        alert('Please enter an API key first');
+        return;
+      }
+      
       const prompt = document.getElementById('visionPrompt').value;
       const responseBox = document.getElementById('visionResponse');
       responseBox.textContent = 'Loading...';
@@ -94,11 +215,11 @@
         reader.readAsDataURL(imgBlob);
       });
       try {
-        const res = await fetch('http://localhost:8080/v1/chat/completions', {
+        const res = await fetch(`${host}/v1/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Api-Key': apiKey
+            'Api-Key': key
           },
           body: JSON.stringify({
             model: 'gpt-4o',
