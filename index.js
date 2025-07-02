@@ -5,15 +5,15 @@ import path from 'path';
 import sqlite3 from 'sqlite3';
 import { fileURLToPath } from 'url';
 
+// --- Path setup and config file locations ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const KEYS_PATH = path.join(__dirname, 'keys.json');
 const LOG_PATH = path.join(__dirname, 'access.log');
 const DB_PATH = path.join(__dirname, 'usage.sqlite');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
-// Ensure keys.json exists
+// --- Ensure keys.json exists with example users ---
 if (!fs.existsSync(KEYS_PATH)) {
   fs.writeFileSync(KEYS_PATH, JSON.stringify([
     { key: "user-api-key-1", name: "Alice", email: "alice@example.com" },
@@ -22,9 +22,9 @@ if (!fs.existsSync(KEYS_PATH)) {
   console.log('✅ Created default keys.json');
 }
 
+// --- Load OpenAI API key from config or env ---
 const OPENAI_HOST = 'api.openai.com';
 let OPENAI_API_KEY = 'sk-...';
-
 try {
   const configRaw = fs.readFileSync(CONFIG_PATH, 'utf-8');
   const config = JSON.parse(configRaw);
@@ -38,7 +38,7 @@ try {
 
 let VALID_KEYS = new Map();
 
-// 🗃️ Initialize SQLite database
+// --- Initialize SQLite DB for usage logging ---
 const db = new sqlite3.Database(DB_PATH);
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS usage_log (
@@ -53,6 +53,7 @@ db.serialize(() => {
   )`);
 });
 
+// --- Log usage to DB if model and tokens are valid ---
 function logToDB(apiKey, model, endpoint, prompt, completion) {
   // Only log if model is a non-empty string and at least one token is nonzero
   if (!model || model === 'unknown') return;
@@ -66,6 +67,7 @@ function logToDB(apiKey, model, endpoint, prompt, completion) {
   );
 }
 
+// --- Load API keys from keys.json into memory ---
 function loadKeys() {
   try {
     const raw = fs.readFileSync(KEYS_PATH, 'utf-8');
@@ -78,14 +80,16 @@ function loadKeys() {
   }
 }
 loadKeys();
+// --- Hot-reload keys.json on change ---
 fs.watchFile(KEYS_PATH, { interval: 1000 }, () => {
   console.log('🔄 Reloading keys.json...');
   loadKeys();
 });
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb' })); // Large payloads for images
 
+// --- CORS and preflight handling ---
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -96,6 +100,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Main proxy handler ---
 app.use((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
@@ -238,5 +243,5 @@ app.use((req, res) => {
 });
 
 app.listen(8080, () => {
-  console.log('🚀 OpenAI proxy with SQLite logging on http://localhost:8080');
+  console.log('OpenAI running on http://localhost:8080');
 });

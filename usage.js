@@ -1,21 +1,23 @@
 #!/usr/bin/env node
-// usage.js: Show usage stats for a user specified by email
+// usage.js: Show usage stats for a user specified by email, or all users if no email
 import fs from 'fs';
 import path from 'path';
 import sqlite3 from 'sqlite3';
 import { fileURLToPath } from 'url';
 
+// --- Path setup ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const KEYS_PATH = path.join(__dirname, 'keys.json');
 const DB_PATH = path.join(__dirname, 'usage.sqlite');
 
-// Remove the usage() call and email check so script works with or without email
+// --- Parse arguments ---
 const [,, email] = process.argv;
 
 let userKey = null;
 let userName = null;
 if (email) {
+  // --- Lookup user by email ---
   try {
     const raw = fs.readFileSync(KEYS_PATH, 'utf-8');
     const keys = JSON.parse(raw);
@@ -35,7 +37,7 @@ if (email) {
 const db = new sqlite3.Database(DB_PATH);
 
 if (!email) {
-  // No email: show summary for all users
+  // --- No email: show summary for all users ---
   const raw = fs.readFileSync(KEYS_PATH, 'utf-8');
   const keys = JSON.parse(raw);
   db.all(
@@ -66,6 +68,7 @@ if (!email) {
     }
   );
 } else {
+  // --- Per-user summary ---
   db.get(
     `SELECT COUNT(*) as numPrompts FROM usage_log WHERE api_key = ?`,
     [userKey],

@@ -1,6 +1,6 @@
 # OpenAI Proxy Server
 
-A secure, auditable proxy for OpenAI's API with API key management, usage logging (SQLite), and utility scripts for key management and usage reporting.
+This is a proxy for OpenAI's API with with own API key management. It is designed to handle student access to LLMs in a large classes where access can be managed and logged. 
 
 ## Features
 
@@ -13,8 +13,6 @@ A secure, auditable proxy for OpenAI's API with API key management, usage loggin
 - **Utility Scripts**:
   - `create.js`: Add new API keys to `keys.json`.
   - `usage.js`: Report usage by user or for all users.
-- **Security**: Sensitive files (`config.json`, `keys.json`, `usage.sqlite`, `access.log`) are gitignored by default.
-- **Redacted Logging**: Base64 image data is redacted in logs, with a short prefix for traceability.
 
 ## Setup
 
@@ -92,6 +90,10 @@ A secure, auditable proxy for OpenAI's API with API key management, usage loggin
 - `config.json` — OpenAI API key (gitignored)
 - `usage.sqlite` — Usage database (gitignored)
 - `access.log` — Access log (gitignored)
+
+## Acknowledgement
+
+This proxy was developed with the assistance of AI (GitHub Copilot, GPT-4.1).
 
 ## License
 
