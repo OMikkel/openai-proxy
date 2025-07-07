@@ -323,9 +323,6 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
     socket.on('connect', () => {
       console.log(`[DEBUG] Socket connected to ${OPENAI_HOST}`);
     });
-    socket.on('timeout', () => {
-      console.error('⏰ Socket timeout');
-    });
   });
 
   proxyReq.on('error', err => {
