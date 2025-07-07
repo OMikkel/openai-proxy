@@ -251,6 +251,9 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
   fs.writeFileSync(LOG_PATH, logLine + '\n', { flag: 'a' });
 
   console.log(`[DEBUG] Forwarding request to OpenAI: https://${OPENAI_HOST}${req.url}`);
+  console.log(`[DEBUG] Request size: ${Buffer.byteLength(bodyBuffer)} bytes`);
+  
+  const startTime = Date.now();
   const proxyReq = https.request({
     hostname: OPENAI_HOST,
     path: req.url,
@@ -260,7 +263,7 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(bodyBuffer)
     },
-    timeout: 15000, // 15 seconds
+    timeout: 120000, // 2 minutes for complex requests
     family: 4 // Force IPv4
   }, proxyRes => {
     const responseChunks = [];
@@ -271,6 +274,9 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
     });
     proxyRes.on('end', () => {
       const buffer = Buffer.concat(responseChunks);
+      const responseTime = Date.now() - startTime;
+      console.log(`[DEBUG] Request completed in ${responseTime}ms`);
+      
       const contentType = proxyRes.headers['content-type'] || '';
       if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
         // Handle as text/JSON
@@ -304,16 +310,37 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
   });
 
   proxyReq.on('timeout', () => {
-    console.error('⏰ OpenAI request timed out after 15 seconds');
+    console.error('⏰ OpenAI request timed out after 2 minutes');
     proxyReq.destroy();
-    res.statusCode = 504;
-    res.end('OpenAI request timed out');
+    if (!res.headersSent) {
+      res.statusCode = 504;
+      res.end('OpenAI request timed out');
+    }
+  });
+
+  proxyReq.on('socket', (socket) => {
+    console.log(`[DEBUG] Socket assigned, connecting to ${OPENAI_HOST}`);
+    socket.on('connect', () => {
+      console.log(`[DEBUG] Socket connected to ${OPENAI_HOST}`);
+    });
+    socket.on('timeout', () => {
+      console.error('⏰ Socket timeout');
+    });
   });
 
   proxyReq.on('error', err => {
     console.error('💥 Proxy error:', err.message);
-    res.statusCode = 502;
-    res.end('Bad Gateway');
+    console.error('💥 Error details:', {
+      code: err.code,
+      errno: err.errno,
+      syscall: err.syscall,
+      hostname: err.hostname,
+      port: err.port
+    });
+    if (!res.headersSent) {
+      res.statusCode = 502;
+      res.end('Bad Gateway');
+    }
   });
 
   proxyReq.write(bodyBuffer);
