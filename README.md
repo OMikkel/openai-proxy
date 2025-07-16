@@ -12,6 +12,7 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 - **CORS Support**: Allows cross-origin requests.
 - **Utility Scripts**:
   - `create.js`: Add new API keys to `keys.json`.
+  - `bulk_create.js`: Add multiple users from a CSV file (see below).
   - `usage.js`: Report usage by user or for all users.
 
 ## Setup
@@ -33,12 +34,28 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 
 4. **Add API Users**
 
-   - Edit `keys.json` to add users manually (see below), or use the `create.js` script:
+
+   - **Single user:**
      ```sh
      node create.js <name> <email>
      ```
      - Both `<name>` and `<email>` are required. The script will auto-generate a secure random API key and add the user to `keys.json`.
      - Interactive mode is not supported; you must provide both arguments.
+
+   - **Bulk add users from CSV:**
+     ```sh
+     node bulk_create.js <users.csv>
+     ```
+     - The CSV file should have headers: `name,email`.
+     - Users whose emails already exist in `keys.json` will be skipped (with a log message).
+     - Example CSV:
+       ```csv
+       name,email
+       Alice Smith,alice@example.com
+       Bob Jones,bob@example.com
+       ...
+       ```
+     - A sample file `sample_users.csv` is provided.
 
    - Example `keys.json` entry:
      ```json
