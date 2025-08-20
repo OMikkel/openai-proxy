@@ -1,0 +1,490 @@
+import { describe, it, before, after, beforeEach } from 'mocha';
+import { expect } from 'chai';
+import { OpenAIHttpClient } from '../http-client.js';
+import { MockHttpTransport } from './mock-http-transport.js';
+
+describe('HTTP Client Retry and Backoff Tests', function() {
+  let httpClient;
+  let mockTransport;
+
+  beforeEach(function() {
+    // Create mock transport that simulates HTTP responses
+    mockTransport = new MockHttpTransport();
+    
+    // Create real HTTP client with mock transport injected
+    httpClient = new OpenAIHttpClient({
+      apiKey: 'test-key',
+      maxRetries: 3,
+      baseDelay: 100, // Shorter delays for testing
+      maxDelay: 5000,
+      transport: mockTransport
+    });
+  });
+
+  describe('Rate Limit Retry Scenarios', function() {
+    it('should retry on 429 rate limit and succeed after backoff', async function() {
+      this.timeout(10000);
+
+      // Configure scenario: fail twice with 429, then succeed
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'fail_then_succeed',
+        remainingFailures: 2,
+        failureStatusCode: 429,
+        successResponse: {
+          id: 'chatcmpl-test',
+          object: 'chat.completion',
+          choices: [{
+            message: { role: 'assistant', content: 'Hello from mock!' },
+            finish_reason: 'stop'
+          }],
+          usage: { total_tokens: 10 }
+        }
+      });
+
+      const requestBody = {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test retry' }],
+        max_completion_tokens: 10
+      };
+
+      const startTime = Date.now();
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', requestBody);
+      const endTime = Date.now();
+
+      // Should succeed after retries
+      expect(response.statusCode).to.equal(200);
+      
+      // Should have made 3 requests total (2 failures + 1 success)
+      expect(mockTransport.countRequests()).to.equal(3);
+      
+      // Should have taken some time due to backoff delays (reduced for faster testing)
+      expect(endTime - startTime).to.be.greaterThan(100); // At least 100ms
+      
+      const requestLog = mockTransport.getRequestLog();
+      expect(requestLog).to.have.length(3);
+      
+      // All requests should have idempotency keys for retries
+      requestLog.forEach(log => {
+        expect(log.headers['Idempotency-Key']).to.exist;
+      });
+    });
+
+    it('should respect Retry-After header from rate limit response', async function() {
+      this.timeout(8000);
+
+      // Configure scenario with Retry-After header
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'rate_limit',
+        retryAfter: 2 // 2 seconds
+      });
+
+      const requestBody = {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test retry-after' }],
+        max_completion_tokens: 10
+      };
+
+      const startTime = Date.now();
+      
+      try {
+        await httpClient.makeJsonRequest('/v1/chat/completions', requestBody);
+        expect.fail('Should have thrown an error after exhausting retries');
+      } catch (error) {
+        const endTime = Date.now();
+        
+        // Should have made multiple retry attempts
+        expect(mockTransport.countRequests()).to.be.greaterThan(1);
+        
+        // Should have respected the retry-after delay
+        expect(endTime - startTime).to.be.greaterThan(2000); // At least 2 seconds
+        
+        expect(error.statusCode).to.equal(429);
+      }
+    });
+  });
+
+  describe('Server Error Retry Scenarios', function() {
+    it('should retry on 500 server errors with exponential backoff', async function() {
+      this.timeout(15000);
+
+      // Configure scenario: server errors then success
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'fail_then_succeed',
+        remainingFailures: 3,
+        failureStatusCode: 500,
+        successResponse: {
+          id: 'chatcmpl-retry-test',
+          object: 'chat.completion',
+          choices: [{
+            message: { role: 'assistant', content: 'Recovered from server error!' }
+          }]
+        }
+      });
+
+      const startTime = Date.now();
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test server error retry' }]
+      });
+      const endTime = Date.now();
+
+      expect(response.statusCode).to.equal(200);
+      expect(mockTransport.countRequests()).to.equal(4); // 3 failures + 1 success
+      
+      // Exponential backoff should create increasing delays
+      // With base delay 1000ms: ~1s, ~2s, ~4s = ~7s minimum
+      expect(endTime - startTime).to.be.greaterThan(6000);
+      
+      const json = response.json();
+      expect(json.choices[0].message.content).to.equal('Recovered from server error!');
+    });
+
+    it('should retry on 502 Bad Gateway errors', async function() {
+      this.timeout(8000);
+
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'fail_then_succeed',
+        remainingFailures: 1,
+        failureStatusCode: 502,
+        successResponse: { success: true }
+      });
+
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test 502 retry' }]
+      });
+
+      expect(response.statusCode).to.equal(200);
+      expect(mockTransport.countRequests()).to.equal(2);
+    });
+
+    it('should exhaust retries and throw error after max attempts', async function() {
+      this.timeout(20000);
+
+      // Configure persistent 500 errors
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'server_error',
+        statusCode: 500
+      });
+
+      const startTime = Date.now();
+      
+      try {
+        await httpClient.makeJsonRequest('/v1/chat/completions', {
+          model: 'gpt-5-mini',
+          messages: [{ role: 'user', content: 'Test max retries' }]
+        });
+        expect.fail('Should have thrown an error after max retries');
+      } catch (error) {
+        const endTime = Date.now();
+        
+        expect(error.statusCode).to.equal(500);
+        
+        // Should have made 4 requests total (1 initial + 3 retries)
+        expect(mockTransport.countRequests()).to.equal(4);
+        
+        // Should have taken time for exponential backoff
+        expect(endTime - startTime).to.be.greaterThan(5000);
+      }
+    });
+  });
+
+  describe('Network Error Retry Scenarios', function() {
+    it('should retry on network timeout errors', async function() {
+      this.timeout(5000);
+
+      // Configure transport to fail with timeout, then succeed
+      let timeoutCount = 0;
+      const originalExecuteScenario = mockTransport.executeScenario.bind(mockTransport);
+      mockTransport.executeScenario = async function(scenario, options, data) {
+        if (timeoutCount === 0) {
+          timeoutCount++;
+          const error = new Error('Request timeout');
+          error.code = 'TIMEOUT';
+          throw error;
+        }
+        return mockTransport.createResponse(200, { success: true, recovered: true });
+      };
+
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test timeout retry' }]
+      });
+
+      expect(response.statusCode).to.equal(200);
+      expect(mockTransport.countRequests()).to.equal(2);
+    });
+
+    it('should retry on connection reset errors', async function() {
+      this.timeout(5000);
+
+      // Configure transport to fail with connection reset, then succeed
+      let errorCount = 0;
+      const originalExecuteScenario = mockTransport.executeScenario.bind(mockTransport);
+      mockTransport.executeScenario = async function(scenario, options, data) {
+        errorCount++;
+        if (errorCount === 1) {
+          const error = new Error('Connection reset');
+          error.code = 'ECONNRESET';
+          throw error;
+        } else {
+          return mockTransport.createResponse(200, { success: true, message: 'Connection recovered' });
+        }
+      };
+
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test connection reset' }]
+      });
+
+      expect(response.statusCode).to.equal(200);
+      expect(mockTransport.countRequests()).to.equal(2);
+    });
+
+    it('should not retry on non-retryable network errors', async function() {
+      this.timeout(5000);
+
+      // Set a scenario to ensure executeScenario is called
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'network_error',
+        errorCode: 'ENOTFOUND'
+      });
+
+      // Override executeScenario to simulate DNS resolution failure (non-retryable)
+      mockTransport.executeScenario = async function() {
+        const error = new Error('getaddrinfo ENOTFOUND');
+        error.code = 'ENOTFOUND';
+        throw error;
+      };
+
+      try {
+        await httpClient.makeJsonRequest('/v1/chat/completions', {
+          model: 'gpt-5-mini',
+          messages: [{ role: 'user', content: 'Test non-retryable error' }]
+        });
+        expect.fail('Should have thrown error immediately');
+      } catch (error) {
+        // Should only make one attempt for non-retryable errors
+        expect(mockTransport.countRequests()).to.equal(1);
+        expect(error.code).to.equal('ENOTFOUND');
+      }
+    });
+  });
+
+  describe('Idempotency Key Handling', function() {
+    it('should use same idempotency key for retry attempts', async function() {
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'fail_then_succeed',
+        remainingFailures: 2,
+        failureStatusCode: 429,
+        successResponse: { success: true }
+      });
+
+      await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Test idempotency' }]
+      });
+
+      const requestLog = mockTransport.getRequestLog();
+      expect(requestLog).to.have.length(3);
+
+      // All retry attempts should use the same idempotency key
+      const idempotencyKey = requestLog[0].idempotencyKey;
+      expect(idempotencyKey).to.exist;
+      
+      requestLog.forEach(log => {
+        expect(log.idempotencyKey).to.equal(idempotencyKey);
+      });
+    });
+
+    it('should generate different idempotency keys for different requests', async function() {
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'success',
+        response: { success: true }
+      });
+
+      // Make two separate requests
+      await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'First request' }]
+      });
+
+      await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Second request' }]
+      });
+
+      const requestLog = mockTransport.getRequestLog();
+      expect(requestLog).to.have.length(2);
+
+      // Different requests should have different idempotency keys
+      expect(requestLog[0].idempotencyKey).to.not.equal(requestLog[1].idempotencyKey);
+    });
+  });
+
+  describe('Backoff Timing Verification', function() {
+    it('should implement exponential backoff with jitter', async function() {
+      this.timeout(15000);
+
+      const delays = [];
+      const originalSleep = mockTransport.sleep.bind(mockClient);
+      
+      // Track sleep delays
+      mockTransport.sleep = function(ms) {
+        delays.push(ms);
+        return originalSleep(ms); // Actually perform the sleep
+      };
+
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'server_error',
+        statusCode: 503
+      });
+
+      try {
+        await httpClient.makeJsonRequest('/v1/chat/completions', {
+          model: 'gpt-5-mini',
+          messages: [{ role: 'user', content: 'Test backoff timing' }]
+        });
+      } catch (error) {
+        // Expected to fail after retries
+      }
+
+      // Should have made 3 retry delays
+      expect(delays).to.have.length(3);
+      
+      // Delays should increase exponentially (with jitter, so roughly)
+      expect(delays[0]).to.be.within(1000, 2000); // ~1s + jitter
+      expect(delays[1]).to.be.within(2000, 3000); // ~2s + jitter  
+      expect(delays[2]).to.be.within(4000, 5000); // ~4s + jitter
+      
+      // Each delay should be roughly double the previous (allowing for jitter)
+      expect(delays[1]).to.be.greaterThan(delays[0] * 1.5);
+      expect(delays[2]).to.be.greaterThan(delays[1] * 1.5);
+    });
+
+    it('should cap delays at maximum configured value', async function() {
+      this.timeout(10000);
+
+      // Create client with low max delay for testing
+      const testTransport = new MockHttpTransport();
+      const testClient = new OpenAIHttpClient({
+        apiKey: 'test-key',
+        maxRetries: 3,
+        baseDelay: 5000, // Large base delay
+        maxDelay: 2000, // Cap at 2 seconds
+        transport: testTransport
+      });
+      
+      const delays = [];
+      const originalSleep = testClient.sleep;
+      testClient.sleep = function(ms) {
+        delays.push(ms);
+        return originalSleep.call(this, ms);
+      };
+
+      // Configure transport to always fail  
+      testTransport.setScenario('/v1/chat/completions', {
+        type: 'server_error',
+        statusCode: 500
+      });
+
+      try {
+        await testClient.makeJsonRequest('/v1/chat/completions', {
+          model: 'gpt-5-mini',
+          messages: [{ role: 'user', content: 'Test max delay' }]
+        });
+      } catch (error) {
+        // Expected to fail
+      }
+
+      // All delays should be capped at maxDelay
+      delays.forEach(delay => {
+        expect(delay).to.be.at.most(2000);
+      });
+    });
+  });
+
+  describe('Mixed Scenario Testing', function() {
+    it('should handle complex failure patterns', async function() {
+      this.timeout(20000);
+
+      // Set a scenario to ensure executeScenario is called
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'complex_failure'
+      });
+
+      // Complex scenario: 429 -> 500 -> 502 -> success
+      let requestCount = 0;
+      mockTransport.executeScenario = async function(scenario, options, data) {
+        requestCount++;
+        
+        switch (requestCount) {
+          case 1:
+            return mockTransport.createResponse(429, {
+              error: { message: 'Rate limited' }
+            }, { 'retry-after': '1' });
+          case 2:
+            return mockTransport.createResponse(500, {
+              error: { message: 'Server error' }
+            });
+          case 3:
+            return mockTransport.createResponse(502, {
+              error: { message: 'Bad gateway' }
+            });
+          case 4:
+            return mockTransport.createResponse(200, {
+              id: 'chatcmpl-complex',
+              choices: [{ message: { content: 'Finally succeeded!' } }]
+            });
+          default:
+            throw new Error('Too many requests');
+        }
+      };
+
+      const response = await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Complex retry test' }]
+      });
+
+      expect(response.statusCode).to.equal(200);
+      expect(mockTransport.countRequests()).to.equal(4);
+      
+      const json = response.json();
+      expect(json.choices[0].message.content).to.equal('Finally succeeded!');
+    });
+
+    it('should maintain request log through all retry attempts', async function() {
+      mockTransport.setScenario('/v1/chat/completions', {
+        type: 'fail_then_succeed',
+        remainingFailures: 2,
+        failureStatusCode: 503,
+        successResponse: { success: true }
+      });
+
+      await httpClient.makeJsonRequest('/v1/chat/completions', {
+        model: 'gpt-5-mini',
+        messages: [{ role: 'user', content: 'Request log test' }]
+      });
+
+      const requestLog = mockTransport.getRequestLog();
+      expect(requestLog).to.have.length(3);
+
+      // All requests should be logged with proper details
+      requestLog.forEach((log, index) => {
+        expect(log.timestamp).to.exist;
+        expect(log.path).to.equal('/v1/chat/completions');
+        expect(log.method).to.equal('POST');
+        expect(log.headers).to.exist;
+        expect(log.data).to.exist;
+        expect(log.idempotencyKey).to.exist;
+      });
+
+      // Timestamps should be in order
+      for (let i = 1; i < requestLog.length; i++) {
+        const prev = new Date(requestLog[i-1].timestamp);
+        const curr = new Date(requestLog[i].timestamp);
+        expect(curr.getTime()).to.be.greaterThan(prev.getTime());
+      }
+    });
+  });
+});

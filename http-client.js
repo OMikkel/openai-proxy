@@ -2,88 +2,20 @@ import https from 'https';
 import { promisify } from 'util';
 
 /**
- * HTTP Client Service for OpenAI API
- * 
- * This service abstracts HTTP requests to OpenAI and can be easily mocked for testing.
- * It handles retry logic, backoff, idempotency, and error handling.
+ * HTTP Transport Interface
+ * Abstract interface for making HTTP requests - can be mocked for testing
  */
-class OpenAIHttpClient {
-  constructor(config = {}) {
-    this.host = config.host || 'api.openai.com';
-    this.apiKey = config.apiKey;
-    this.timeout = config.timeout || 120000;
-    this.retryConfig = {
-      maxRetries: config.maxRetries || 3,
-      baseDelay: config.baseDelay || 1000,
-      maxDelay: config.maxDelay || 30000,
-      retryOn: config.retryOn || [429, 500, 502, 503, 504]
-    };
-    this.enableIdempotency = config.enableIdempotency !== false;
+class HttpTransport {
+  async executeRequest(options, data) {
+    throw new Error('executeRequest must be implemented by subclass');
   }
+}
 
-  /**
-   * Make an HTTP request with retry logic and backoff
-   */
-  async makeRequest(options, data = null) {
-    const requestOptions = {
-      hostname: this.host,
-      path: options.path,
-      method: options.method || 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        ...options.headers
-      },
-      timeout: options.timeout || this.timeout,
-      family: 4 // Force IPv4
-    };
-
-    // Add idempotency key for retryable requests
-    if (this.enableIdempotency && ['POST', 'PUT', 'PATCH'].includes(requestOptions.method)) {
-      if (!requestOptions.headers['Idempotency-Key']) {
-        requestOptions.headers['Idempotency-Key'] = this.generateIdempotencyKey();
-      }
-    }
-
-    let lastError;
-    for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
-      try {
-        const result = await this.executeRequest(requestOptions, data);
-        
-        // Success or non-retryable error
-        if (!this.shouldRetry(result.statusCode, attempt)) {
-          return result;
-        }
-        
-        // Prepare for retry
-        lastError = new Error(`HTTP ${result.statusCode}: ${result.statusText}`);
-        lastError.statusCode = result.statusCode;
-        lastError.response = result;
-        
-      } catch (error) {
-        lastError = error;
-        
-        // Don't retry on non-retryable errors
-        if (!this.shouldRetryError(error, attempt)) {
-          throw error;
-        }
-      }
-
-      // Calculate delay for next attempt
-      if (attempt < this.retryConfig.maxRetries) {
-        const delay = this.calculateRetryDelay(attempt, lastError);
-        console.log(`[HTTP] Retrying request in ${delay}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries})`);
-        await this.sleep(delay);
-      }
-    }
-
-    // All retries exhausted
-    throw lastError;
-  }
-
-  /**
-   * Execute a single HTTP request (without retry logic)
-   */
-  executeRequest(options, data) {
+/**
+ * Real HTTP Transport - makes actual HTTPS requests to OpenAI
+ */
+class RealHttpTransport extends HttpTransport {
+  async executeRequest(options, data) {
     return new Promise((resolve, reject) => {
       const req = https.request(options, (res) => {
         const chunks = [];
@@ -136,6 +68,97 @@ class OpenAIHttpClient {
       req.end();
     });
   }
+}
+
+/**
+ * HTTP Client Service for OpenAI API
+ * 
+ * This service abstracts HTTP requests to OpenAI and handles retry logic, backoff, 
+ * idempotency, and error handling. Uses dependency injection for the transport layer.
+ */
+class OpenAIHttpClient {
+  constructor(config = {}) {
+    this.host = config.host || 'api.openai.com';
+    this.apiKey = config.apiKey;
+    this.timeout = config.timeout || 120000;
+    this.retryConfig = {
+      maxRetries: config.maxRetries || 3,
+      baseDelay: config.baseDelay || 1000,
+      maxDelay: config.maxDelay || 30000,
+      retryOn: config.retryOn || [429, 500, 502, 503, 504]
+    };
+    this.enableIdempotency = config.enableIdempotency !== false;
+    
+    // Dependency injection: use provided transport or default to real HTTP
+    this.transport = config.transport || new RealHttpTransport();
+  }
+
+  /**
+   * Set the HTTP transport (for testing)
+   */
+  setTransport(transport) {
+    this.transport = transport;
+  }
+
+  /**
+   * Make an HTTP request with retry logic and backoff
+   */
+  async makeRequest(options, data = null) {
+    const requestOptions = {
+      hostname: this.host,
+      path: options.path,
+      method: options.method || 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        ...options.headers
+      },
+      timeout: options.timeout || this.timeout,
+      family: 4 // Force IPv4
+    };
+
+    // Add idempotency key for retryable requests
+    if (this.enableIdempotency && ['POST', 'PUT', 'PATCH'].includes(requestOptions.method)) {
+      if (!requestOptions.headers['Idempotency-Key']) {
+        requestOptions.headers['Idempotency-Key'] = this.generateIdempotencyKey();
+      }
+    }
+
+    let lastError;
+    for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
+      try {
+        // Use the injected transport to make the actual request
+        const result = await this.transport.executeRequest(requestOptions, data);
+        
+        // Success or non-retryable error
+        if (!this.shouldRetry(result.statusCode, attempt)) {
+          return result;
+        }
+        
+        // Prepare for retry
+        lastError = new Error(`HTTP ${result.statusCode}: ${result.statusText}`);
+        lastError.statusCode = result.statusCode;
+        lastError.response = result;
+        
+      } catch (error) {
+        lastError = error;
+        
+        // Don't retry on non-retryable errors
+        if (!this.shouldRetryError(error, attempt)) {
+          throw error;
+        }
+      }
+
+      // Calculate delay for next attempt
+      if (attempt < this.retryConfig.maxRetries) {
+        const delay = this.calculateRetryDelay(attempt, lastError);
+        console.log(`[HTTP] Retrying request in ${delay}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries})`);
+        await this.sleep(delay);
+      }
+    }
+
+    // All retries exhausted
+    throw lastError;
+  }
 
   /**
    * Determine if we should retry based on status code and attempt number
@@ -153,8 +176,8 @@ class OpenAIHttpClient {
       return false;
     }
 
-    // Retry on network errors, timeouts, etc.
-    const retryableErrorCodes = ['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'TIMEOUT'];
+    // Retry on network errors, timeouts, etc. but NOT on DNS resolution failures
+    const retryableErrorCodes = ['ECONNRESET', 'ECONNREFUSED', 'TIMEOUT'];
     return retryableErrorCodes.includes(error.code);
   }
 
@@ -258,236 +281,4 @@ class OpenAIHttpClient {
   }
 }
 
-/**
- * Mock HTTP Client for Testing
- * 
- * This mock allows you to simulate various scenarios without making real HTTP requests.
- */
-class MockOpenAIHttpClient {
-  constructor(config = {}) {
-    this.scenarios = new Map();
-    this.requestLog = [];
-    this.defaultResponse = {
-      statusCode: 200,
-      statusText: 'OK',
-      headers: { 'content-type': 'application/json' },
-      data: Buffer.from('{"mock": true}'),
-      text: '{"mock": true}',
-      json: () => ({ mock: true })
-    };
-  }
-
-  /**
-   * Configure a scenario for specific endpoints
-   */
-  setScenario(pathPattern, scenario) {
-    this.scenarios.set(pathPattern, scenario);
-  }
-
-  /**
-   * Clear all scenarios and request logs
-   */
-  clearScenarios() {
-    this.scenarios.clear();
-    this.requestLog = [];
-  }
-
-  /**
-   * Get request history
-   */
-  getRequestLog() {
-    return [...this.requestLog];
-  }
-
-  /**
-   * Count requests matching a pattern
-   */
-  countRequests(pathPattern = null) {
-    if (!pathPattern) return this.requestLog.length;
-    return this.requestLog.filter(log => log.path.includes(pathPattern)).length;
-  }
-
-  /**
-   * Mock the makeRequest method
-   */
-  async makeRequest(options, data = null) {
-    // Log the request
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      path: options.path,
-      method: options.method,
-      headers: options.headers,
-      data: data,
-      idempotencyKey: options.headers?.['Idempotency-Key']
-    };
-    this.requestLog.push(logEntry);
-
-    // Find matching scenario
-    const scenario = this.findScenario(options.path);
-    
-    if (scenario) {
-      return this.executeScenario(scenario, options, data);
-    }
-
-    // Return default success response
-    return this.defaultResponse;
-  }
-
-  /**
-   * Find scenario matching the request path
-   */
-  findScenario(path) {
-    // Check for exact match first
-    if (this.scenarios.has(path)) {
-      return this.scenarios.get(path);
-    }
-
-    // Check for pattern matches
-    for (const [pattern, scenario] of this.scenarios.entries()) {
-      if (pattern === '*' || path.includes(pattern)) {
-        return scenario;
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Execute a mock scenario
-   */
-  async executeScenario(scenario, options, data) {
-    // Apply delay if configured
-    if (scenario.delay) {
-      await this.sleep(scenario.delay);
-    }
-
-    // Handle different scenario types
-    switch (scenario.type) {
-      case 'success':
-        return this.createResponse(200, scenario.response || this.defaultResponse.json());
-
-      case 'rate_limit':
-        const retryAfter = scenario.retryAfter || 1;
-        return this.createResponse(429, {
-          error: {
-            message: 'Rate limit exceeded',
-            type: 'rate_limit_exceeded',
-            code: 'rate_limit_exceeded'
-          }
-        }, { 'retry-after': retryAfter.toString() });
-
-      case 'server_error':
-        return this.createResponse(scenario.statusCode || 500, {
-          error: {
-            message: 'Internal server error',
-            type: 'server_error',
-            code: 'server_error'
-          }
-        });
-
-      case 'timeout':
-        const error = new Error('Request timeout');
-        error.code = 'TIMEOUT';
-        throw error;
-
-      case 'network_error':
-        const networkError = new Error('Network error');
-        networkError.code = scenario.errorCode || 'ECONNRESET';
-        throw networkError;
-
-      case 'fail_then_succeed':
-        // Decrement failure counter
-        if (scenario.remainingFailures > 0) {
-          scenario.remainingFailures--;
-          return this.createResponse(scenario.failureStatusCode || 500, {
-            error: { message: 'Temporary failure' }
-          });
-        } else {
-          return this.createResponse(200, scenario.successResponse || this.defaultResponse.json());
-        }
-
-      default:
-        return this.createResponse(scenario.statusCode || 200, scenario.response || this.defaultResponse.json());
-    }
-  }
-
-  /**
-   * Create a mock response object
-   */
-  createResponse(statusCode, body, headers = {}) {
-    const jsonBody = typeof body === 'string' ? body : JSON.stringify(body);
-    const buffer = Buffer.from(jsonBody);
-    
-    return {
-      statusCode,
-      statusText: this.getStatusText(statusCode),
-      headers: {
-        'content-type': 'application/json',
-        ...headers
-      },
-      data: buffer,
-      text: jsonBody,
-      json: () => typeof body === 'string' ? JSON.parse(body) : body
-    };
-  }
-
-  /**
-   * Get HTTP status text
-   */
-  getStatusText(statusCode) {
-    const statusTexts = {
-      200: 'OK',
-      429: 'Too Many Requests',
-      500: 'Internal Server Error',
-      502: 'Bad Gateway',
-      503: 'Service Unavailable',
-      504: 'Gateway Timeout'
-    };
-    return statusTexts[statusCode] || 'Unknown';
-  }
-
-  /**
-   * Mock JSON request
-   */
-  async makeJsonRequest(path, data, options = {}) {
-    const requestOptions = {
-      path,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(JSON.stringify(data)),
-        ...options.headers
-      },
-      ...options
-    };
-
-    return this.makeRequest(requestOptions, JSON.stringify(data));
-  }
-
-  /**
-   * Mock multipart request
-   */
-  async makeMultipartRequest(path, bodyBuffer, boundary, options = {}) {
-    const requestOptions = {
-      path,
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': Buffer.byteLength(bodyBuffer),
-        ...options.headers
-      },
-      ...options
-    };
-
-    return this.makeRequest(requestOptions, bodyBuffer);
-  }
-
-  /**
-   * Sleep utility
-   */
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
-
-export { OpenAIHttpClient, MockOpenAIHttpClient };
+export { OpenAIHttpClient, HttpTransport, RealHttpTransport };
