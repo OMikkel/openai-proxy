@@ -5,11 +5,13 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 ## Features
 
 - **API Key Management**: Restrict access to the proxy using per-user API keys stored in `keys.json` (hot-reloads on change).
+- **Rate Limiting**: Comprehensive rate limiting with per-user and global limits, automatic queuing, and overflow protection.
 - **Usage Logging**: All usage is logged to a local SQLite database (`usage.sqlite`) for reporting and auditing.
 - **Access Logging**: All requests are logged to `access.log` (with sensitive data redacted).
 - **OpenAI API Forwarding**: Forwards requests to OpenAI's API, adding your configured API key.
 - **Large Payload Support**: Handles requests up to 50MB (for image/multimodal support).
 - **CORS Support**: Allows cross-origin requests.
+- **Monitoring**: Health and metrics endpoints for system monitoring.
 - **Utility Scripts**:
   - `create.js`: Add new API keys to `keys.json`.
   - `bulk_create.js`: Add multiple users from a CSV file (see below).
@@ -29,8 +31,17 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 
    - Copy `config-example.json` to `config.json` and add your OpenAI API key:
      ```json
-     { "OPENAI_API_KEY": "sk-..." }
+     { 
+       "OPENAI_API_KEY": "sk-...",
+       "RATE_LIMITING": {
+         "enabled": true,
+         "global": { "requests_per_minute": 800, "concurrent_limit": 40, "queue_size": 100 },
+         "per_user": { "requests_per_minute": 60, "concurrent_limit": 2, "queue_size": 10 },
+         "metrics_enabled": true
+       }
+     }
      ```
+   - **Rate limiting is enabled by default**. See the Rate Limiting section below for configuration details.
 
 4. **Add API Users**
 
@@ -92,6 +103,27 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
   node usage.js
   ```
 
+## Testing
+
+The proxy includes comprehensive test suites to verify functionality:
+
+### **Test Suites**
+- **Comprehensive Tests**: Full end-to-end testing of all proxy features
+  ```sh
+  npm test
+  ```
+- **Rate Limiting Tests**: Detailed verification of rate limiting behavior
+  ```sh
+  npm run test:rate-limit
+  ```
+- **Enforcement Tests**: Safe rate limiting verification without heavy API usage
+  ```sh
+  npm run test:enforcement
+  ```
+
+### **Test Configuration**
+Tests use the API keys defined in `keys.json`. For rate limiting tests, ensure you have test keys configured or the tests will use default test keys.
+
 ## Security & Privacy
 
 - All sensitive/runtime files are gitignored.
@@ -104,9 +136,10 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 - `create.js` — Add new API keys
 - `usage.js` — Usage reporting tool
 - `keys.json` — API key storage (gitignored)
-- `config.json` — OpenAI API key (gitignored)
+- `config.json` — OpenAI API key and configuration (gitignored)
 - `usage.sqlite` — Usage database (gitignored)
 - `access.log` — Access log (gitignored)
+- `test/` — Test suites for comprehensive functionality verification
 
 ## Scaling & Cleanup
 
@@ -119,6 +152,58 @@ The proxy is designed to handle high-volume usage (e.g., 150 students uploading 
 - **Graceful Shutdown**: Cleans up all temp files when server stops
 
 ### **Rate Limiting**
+
+The proxy includes comprehensive rate limiting to manage API usage and prevent abuse:
+
+#### **Configuration**
+Rate limiting is configured in `config.json` under the `RATE_LIMITING` section:
+
+```json
+{
+  "RATE_LIMITING": {
+    "global": {
+      "requests_per_minute": 800,
+      "concurrent_limit": 40,
+      "queue_size": 100
+    },
+    "per_user": {
+      "requests_per_minute": 60,
+      "concurrent_limit": 2,
+      "queue_size": 10
+    },
+    "enabled": true,
+    "metrics_enabled": true
+  }
+}
+```
+
+#### **Rate Limiting Types**
+
+- **Global Limits**: Apply across all users
+  - `requests_per_minute`: Maximum requests per minute across all users (default: 800)
+  - `concurrent_limit`: Maximum concurrent requests across all users (default: 40)
+  - `queue_size`: Maximum queued requests when concurrent limit is reached (default: 100)
+
+- **Per-User Limits**: Apply to individual users
+  - `requests_per_minute`: Maximum requests per minute per user (default: 60)
+  - `concurrent_limit`: Maximum concurrent requests per user (default: 2)
+  - `queue_size`: Maximum queued requests per user (default: 10)
+
+#### **Enabling/Disabling Rate Limiting**
+
+- **Enable**: Set `"enabled": true` in the rate limiting configuration
+- **Disable**: Set `"enabled": false` to completely disable rate limiting
+- **Metrics**: Set `"metrics_enabled": true` to enable Prometheus metrics collection
+
+#### **Behavior**
+- Requests exceeding concurrent limits are queued automatically
+- Requests exceeding queue limits receive HTTP 503 (Service Unavailable)
+- Requests exceeding rate limits receive HTTP 429 (Too Many Requests)
+- Queue processing follows FIFO (First In, First Out) order
+
+#### **Monitoring**
+- **Health Endpoint**: `GET /health` - Shows current queue status and active users
+- **Metrics Endpoint**: `GET /metrics` - Prometheus-format metrics for monitoring
 - **Upload Limits**: Max 10 concurrent uploads per user (prevents resource exhaustion)
 - **File Limits**: Max 5 files per request, 50MB per file
 - **File Type Validation**: Only allows audio formats for audio endpoints

@@ -1,3 +1,17 @@
 {
-  "OPENAI_API_KEY": "sk-your-openai-key-here"
+  "OPENAI_API_KEY": "sk-your-openai-key-here",
+  "RATE_LIMITING": {
+    "global": {
+      "requests_per_minute": 800,
+      "concurrent_limit": 40,
+      "queue_size": 100
+    },
+    "per_user": {
+      "requests_per_minute": 60,
+      "concurrent_limit": 2,
+      "queue_size": 10
+    },
+    "enabled": true,
+    "metrics_enabled": true
+  }
 }

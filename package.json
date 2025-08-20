@@ -11,9 +11,11 @@
     "url": "git+https://github.com/cklokmose/openai-proxy.git"
   },
   "dependencies": {
+    "bottleneck": "^2.19.5",
     "express": "^4.19.2",
     "form-data": "^4.0.3",
     "multer": "^2.0.1",
+    "prom-client": "^15.1.3",
     "sqlite3": "^5.1.7"
   },
   "license": "MIT",
@@ -21,6 +23,14 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "mocha test/**/*.test.js --timeout 60000",
+    "test:comprehensive": "mocha test/comprehensive.test.js --timeout 120000",
+    "test:rate-limit": "mocha test/rate-limit.test.js --timeout 60000",
+    "test:multi-user": "mocha test/multi-user-rate-limit.test.js --timeout 60000",
+    "test:enforcement": "mocha test/rate-limit-enforcement.test.js --timeout 30000"
+  },
+  "devDependencies": {
+    "chai": "^5.3.1",
+    "mocha": "^11.7.1"
   }
 }

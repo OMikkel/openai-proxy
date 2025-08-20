@@ -5,6 +5,8 @@ import path from 'path';
 import sqlite3 from 'sqlite3';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
+import { scheduleRequest, getQueueStatus, shutdown as shutdownRateLimiter, isRateLimitingEnabled, getRateLimitConfig } from './rate-limit.js';
+import { getMetrics, recordRequest, recordLatency, recordTokenUsage, recordDroppedRequest, stopMetrics, areMetricsEnabled } from './metrics.js';
 
 // --- Path setup and config file locations ---
 const __filename = fileURLToPath(import.meta.url);
@@ -139,8 +141,29 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Metrics endpoint ---
+app.get('/metrics', async (req, res) => {
+  if (!areMetricsEnabled()) {
+    return res.status(404).json({ error: 'Metrics endpoint is disabled' });
+  }
+  
+  res.setHeader('Content-Type', 'text/plain');
+  const metrics = await getMetrics();
+  res.end(metrics);
+});
+
+// --- Health check endpoint ---
+app.get('/health', (req, res) => {
+  const queueStatus = getQueueStatus();
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    queue: queueStatus
+  });
+});
+
 // --- Main proxy handler ---
-app.use((req, res) => {
+app.use(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   // Robustly extract API key from headers (case-insensitive, trim, support common variants)
@@ -165,6 +188,7 @@ app.use((req, res) => {
   const user = VALID_KEYS.get(userKey);
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const timestamp = new Date().toISOString();
+  const startTime = Date.now();
 
   console.log(`[DEBUG] Incoming request: ${req.method} ${req.url} from ${ip}`);
   console.log(`[DEBUG] Headers:`, req.headers);
@@ -173,40 +197,75 @@ app.use((req, res) => {
     const line = `[${timestamp}] ❌ Invalid or missing API key from ${ip} → ${req.method} ${req.url}`;
     console.warn(line);
     fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
+    recordRequest(req.method, req.url, 403, 'unknown');
     return res.status(403).json({ error: 'Invalid or missing API key' });
   }
 
-  // Handle multipart/form-data for audio endpoints
-  const isMultipartEndpoint = req.url.includes('/audio/') && 
-    req.headers['content-type']?.startsWith('multipart/form-data');
+  // Wrap the entire request processing in rate limiting (if enabled)
+  try {
+    const processRequest = async () => {
+      // Handle multipart/form-data for audio endpoints
+      const isMultipartEndpoint = req.url.includes('/audio/') && 
+        req.headers['content-type']?.startsWith('multipart/form-data');
 
-  if (isMultipartEndpoint) {
-    // Check rate limit for uploads
-    if (!checkUploadRateLimit(userKey)) {
-      const line = `[${timestamp}] ⚠️ Rate limit exceeded for ${user.name} from ${ip} → ${req.method} ${req.url}`;
-      console.warn(line);
-      fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
-      return res.status(429).json({ error: 'Too many concurrent uploads. Please wait and try again.' });
+      if (isMultipartEndpoint) {
+        // Check basic upload rate limit for uploads (keeping the existing simple check)
+        if (!checkUploadRateLimit(userKey)) {
+          const line = `[${timestamp}] ⚠️ Rate limit exceeded for ${user.name} from ${ip} → ${req.method} ${req.url}`;
+          console.warn(line);
+          fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
+          recordRequest(req.method, req.url, 429, userKey);
+          res.status(429).json({ error: 'Too many concurrent uploads. Please wait and try again.' });
+          return;
+        }
+        
+        // Use multer to parse multipart data
+        upload.any()(req, res, (err) => {
+          // Always release the upload slot
+            releaseUploadSlot(userKey);
+            
+            if (err) {
+              console.error('Multer error:', err);
+              const responseTime = (Date.now() - startTime) / 1000;
+              recordRequest(req.method, req.url, 400, userKey);
+              recordLatency(req.method, req.url, 400, responseTime);
+              return res.status(400).json({ error: `Failed to parse multipart data: ${err.message}` });
+            }
+            handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime);
+          });
+        } else {
+          handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime);
+        }
+    };
+
+    // Use rate limiting if enabled, otherwise process directly
+    if (isRateLimitingEnabled()) {
+      await scheduleRequest(userKey, processRequest);
+    } else {
+      await processRequest();
+    }
+  } catch (error) {
+    const responseTime = (Date.now() - startTime) / 1000;
+    
+    if (error.code === 'QUEUE_OVERFLOW') {
+      console.warn(`⚠️ Queue overflow for ${user.name} from ${ip} → ${req.method} ${req.url}`);
+      recordDroppedRequest('user');
+      recordRequest(req.method, req.url, 503, userKey);
+      recordLatency(req.method, req.url, 503, responseTime);
+      return res.status(503).json({ 
+        error: 'Service temporarily overloaded. Please wait and try again.',
+        retryAfter: 30 
+      });
     }
     
-    // Use multer to parse multipart data
-    upload.any()(req, res, (err) => {
-      // Always release the upload slot
-      releaseUploadSlot(userKey);
-      
-      if (err) {
-        console.error('Multer error:', err);
-        return res.status(400).json({ error: `Failed to parse multipart data: ${err.message}` });
-      }
-      handleMultipartRequest(req, res, user, userKey, timestamp, ip);
-    });
-  } else {
-    handleJsonRequest(req, res, user, userKey, timestamp, ip);
+    console.error('❌ Rate limiting error:', error.message);
+    recordRequest(req.method, req.url, 500, userKey);
+    recordLatency(req.method, req.url, 500, responseTime);
+    return res.status(500).json({ error: 'Internal server error' });
   }
-
 });
 
-function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
+function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime) {
   // Utility: Redact base64 image data in request body for logging, but log a short prefix for traceability
   function redactBase64Images(obj) {
     if (Array.isArray(obj)) {
@@ -253,7 +312,6 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
   console.log(`[DEBUG] Forwarding request to OpenAI: https://${OPENAI_HOST}${req.url}`);
   console.log(`[DEBUG] Request size: ${Buffer.byteLength(bodyBuffer)} bytes`);
   
-  const startTime = Date.now();
   const proxyReq = https.request({
     hostname: OPENAI_HOST,
     path: req.url,
@@ -275,7 +333,12 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
     proxyRes.on('end', () => {
       const buffer = Buffer.concat(responseChunks);
       const responseTime = Date.now() - startTime;
+      const responseTimeSeconds = responseTime / 1000;
       console.log(`[DEBUG] Request completed in ${responseTime}ms`);
+      
+      // Record request metrics
+      recordRequest(req.method, req.url, proxyRes.statusCode, userKey);
+      recordLatency(req.method, req.url, proxyRes.statusCode, responseTimeSeconds);
       
       const contentType = proxyRes.headers['content-type'] || '';
       if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
@@ -289,6 +352,11 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
           const prompt = usage.prompt_tokens || 0;
           const completion = usage.completion_tokens || 0;
           const total = prompt + completion;
+
+          // Record token usage metrics
+          if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
+          if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
+          if (total > 0) recordTokenUsage('total', model, userKey, total);
 
           const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
           console.log(usageLine);
@@ -311,6 +379,9 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
 
   proxyReq.on('timeout', () => {
     console.error('⏰ OpenAI request timed out after 2 minutes');
+    const responseTime = (Date.now() - startTime) / 1000;
+    recordRequest(req.method, req.url, 504, userKey);
+    recordLatency(req.method, req.url, 504, responseTime);
     proxyReq.destroy();
     if (!res.headersSent) {
       res.statusCode = 504;
@@ -334,6 +405,9 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
       hostname: err.hostname,
       port: err.port
     });
+    const responseTime = (Date.now() - startTime) / 1000;
+    recordRequest(req.method, req.url, 502, userKey);
+    recordLatency(req.method, req.url, 502, responseTime);
     if (!res.headersSent) {
       res.statusCode = 502;
       res.end('Bad Gateway');
@@ -344,7 +418,7 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip) {
   proxyReq.end();
 }
 
-function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
+function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime) {
   const uploadedFiles = req.files || [];
   
   // Cleanup function to remove temporary files
@@ -427,6 +501,13 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
         cleanupFiles();
         
         const buffer = Buffer.concat(responseChunks);
+        const responseTime = Date.now() - startTime;
+        const responseTimeSeconds = responseTime / 1000;
+        
+        // Record request metrics
+        recordRequest(req.method, req.url, proxyRes.statusCode, userKey);
+        recordLatency(req.method, req.url, proxyRes.statusCode, responseTimeSeconds);
+        
         const contentType = proxyRes.headers['content-type'] || '';
         if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
           // Handle as text/JSON
@@ -442,6 +523,11 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
             const total = prompt + completion;
 
             if (total > 0) {
+              // Record token usage metrics
+              if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
+              if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
+              if (total > 0) recordTokenUsage('total', model, userKey, total);
+
               const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
               console.log(usageLine);
               fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
@@ -463,6 +549,9 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
 
     proxyReq.on('timeout', () => {
       console.error('⏰ OpenAI request timed out after 30 seconds');
+      const responseTime = (Date.now() - startTime) / 1000;
+      recordRequest(req.method, req.url, 504, userKey);
+      recordLatency(req.method, req.url, 504, responseTime);
       cleanupFiles(); // Cleanup on timeout
       proxyReq.destroy();
       res.statusCode = 504;
@@ -471,6 +560,9 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
 
     proxyReq.on('error', err => {
       console.error('💥 Proxy error:', err.message);
+      const responseTime = (Date.now() - startTime) / 1000;
+      recordRequest(req.method, req.url, 502, userKey);
+      recordLatency(req.method, req.url, 502, responseTime);
       cleanupFiles(); // Cleanup on error
       res.statusCode = 502;
       res.end('Bad Gateway');
@@ -481,6 +573,9 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip) {
     
   } catch (err) {
     console.error('💥 Error processing multipart request:', err.message);
+    const responseTime = (Date.now() - startTime) / 1000;
+    recordRequest(req.method, req.url, 500, userKey);
+    recordLatency(req.method, req.url, 500, responseTime);
     cleanupFiles(); // Cleanup on processing error
     res.status(500).json({ error: 'Internal server error processing upload' });
   }
@@ -573,18 +668,36 @@ setInterval(cleanupTempFiles, CLEANUP_INTERVAL);
 setInterval(rotateLogs, CLEANUP_INTERVAL);
 
 // Cleanup on shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down server...');
-  cleanupTempFiles();
+  try {
+    await shutdownRateLimiter();
+    stopMetrics();
+    cleanupTempFiles();
+    console.log('✅ Graceful shutdown completed');
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error.message);
+  }
   process.exit(0);
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('\n🛑 Server terminated...');
-  cleanupTempFiles();
+  try {
+    await shutdownRateLimiter();
+    stopMetrics();
+    cleanupTempFiles();
+    console.log('✅ Graceful shutdown completed');
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error.message);
+  }
   process.exit(0);
 });
 
 app.listen(8080, () => {
-  console.log('OpenAI running on http://localhost:8080');
+  console.log('🚀 OpenAI Proxy running on http://localhost:8080');
+  console.log('📊 Metrics available at http://localhost:8080/metrics');
+  console.log('❤️ Health check at http://localhost:8080/health');
+  console.log('🎛️ Rate limiting: 800 req/min global, 60 req/min per user');
+  console.log('⚡ Max concurrent: 40 global, 2 per user');
 });
