@@ -27,7 +27,8 @@
     "test:comprehensive": "mocha test/comprehensive.test.js --timeout 120000",
     "test:rate-limit": "mocha test/rate-limit.test.js --timeout 60000",
     "test:multi-user": "mocha test/multi-user-rate-limit.test.js --timeout 60000",
-    "test:enforcement": "mocha test/rate-limit-enforcement.test.js --timeout 30000"
+    "test:enforcement": "mocha test/rate-limit-enforcement.test.js --timeout 30000",
+    "test:allowlist": "mocha test/test-allowlist.js --timeout 60000"
   },
   "devDependencies": {
     "chai": "^5.3.1",

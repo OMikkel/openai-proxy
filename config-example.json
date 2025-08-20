@@ -13,5 +13,22 @@
     },
     "enabled": true,
     "metrics_enabled": true
+  },
+  "ALLOWLIST": {
+    "enabled": true,
+    "endpoints": [
+      "/v1/chat/completions",
+      "/v1/completions", 
+      "/v1/embeddings",
+      "/v1/audio/speech",
+      "/v1/audio/transcriptions"
+    ],
+    "models": [
+      "gpt-5-mini",
+      "text-embedding-3-small",
+      "tts-1",
+      "tts-1-hd"
+    ],
+    "default_model": "gpt-5-mini"
   }
 }

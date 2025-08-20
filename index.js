@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import { scheduleRequest, getQueueStatus, shutdown as shutdownRateLimiter, isRateLimitingEnabled, getRateLimitConfig } from './rate-limit.js';
 import { getMetrics, recordRequest, recordLatency, recordTokenUsage, recordDroppedRequest, stopMetrics, areMetricsEnabled } from './metrics.js';
+import { isAllowlistEnabled, isEndpointAllowed, validateAndNormalizeRequest, getAllowlistStatus } from './allowlist.js';
 
 // --- Path setup and config file locations ---
 const __filename = fileURLToPath(import.meta.url);
@@ -155,10 +156,12 @@ app.get('/metrics', async (req, res) => {
 // --- Health check endpoint ---
 app.get('/health', (req, res) => {
   const queueStatus = getQueueStatus();
+  const allowlistStatus = getAllowlistStatus();
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    queue: queueStatus
+    queue: queueStatus,
+    allowlist: allowlistStatus
   });
 });
 
@@ -199,6 +202,18 @@ app.use(async (req, res) => {
     fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
     recordRequest(req.method, req.url, 403, 'unknown');
     return res.status(403).json({ error: 'Invalid or missing API key' });
+  }
+
+  // Check if endpoint is allowed (if allowlist is enabled)
+  if (!isEndpointAllowed(req.url)) {
+    const line = `[${timestamp}] 🚫 Endpoint not allowed: ${user.name} from ${ip} → ${req.method} ${req.url}`;
+    console.warn(line);
+    fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
+    recordRequest(req.method, req.url, 403, userKey);
+    return res.status(403).json({ 
+      error: `Endpoint not allowed: ${req.url}`,
+      allowed_endpoints: isAllowlistEnabled() ? getAllowlistStatus().endpoints : "Allowlist disabled"
+    });
   }
 
   // Wrap the entire request processing in rate limiting (if enabled)
@@ -293,9 +308,33 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime) {
   }
 
   // Use body parsed by express.json()
-  const bodyString = JSON.stringify(req.body || {});
+  const originalBody = req.body || {};
+  
+  // Validate and normalize request (model allowlist, etc.)
+  const validation = validateAndNormalizeRequest(originalBody, req.url);
+  if (!validation.valid) {
+    const line = `[${timestamp}] 🚫 Request validation failed: ${user.name} from ${ip} → ${req.method} ${req.url} | ${validation.error}`;
+    console.warn(line);
+    fs.writeFileSync(LOG_PATH, line + '\n', { flag: 'a' });
+    recordRequest(req.method, req.url, 403, userKey);
+    return res.status(403).json({ 
+      error: {
+        message: validation.error,
+        type: "invalid_request_error"
+      }
+    });
+  }
+  
+  const normalizedBody = validation.body;
+  const bodyString = JSON.stringify(normalizedBody);
+  
+  // Log model normalization if it occurred
+  if (originalBody.model !== normalizedBody.model) {
+    console.log(`[INFO] Model normalized: "${originalBody.model || 'undefined'}" → "${normalizedBody.model}"`);
+  }
+  
   // Redact base64 image data for logging
-  const redactedBody = redactBase64Images(req.body || {});
+  const redactedBody = redactBase64Images(normalizedBody);
   const redactedBodyString = JSON.stringify(redactedBody);
 
   // Serialize request body for proxying
@@ -444,6 +483,37 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTim
     size: f.size, 
     mimetype: f.mimetype 
   })));
+
+  // Validate model if allowlist is enabled
+  if (allowlist.getAllowlistStatus().enabled) {
+    if (req.body && req.body.model) {
+      try {
+        const validation = allowlist.validateAndNormalizeRequest(req.body);
+        if (!validation.valid) {
+          cleanupFiles();
+          console.log(`❌ Model not allowed: ${req.body.model} (user: ${user.name})`);
+          return res.status(403).json({
+            error: {
+              message: validation.error || `Model '${req.body.model}' is not allowed`,
+              type: "invalid_request_error"
+            }
+          });
+        }
+        // Update the form data with normalized model
+        req.body.model = validation.body.model;
+        console.log(`✅ Model validated: ${req.body.model}`);
+      } catch (err) {
+        cleanupFiles();
+        console.error('❌ Error validating model:', err.message);
+        return res.status(400).json({
+          error: {
+            message: "Invalid request format",
+            type: "invalid_request_error"
+          }
+        });
+      }
+    }
+  }
 
   // Reconstruct multipart form data
   const boundary = '----formdata-openai-proxy-' + Math.random().toString(36);
