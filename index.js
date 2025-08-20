@@ -1,5 +1,4 @@
 import fs from 'fs';
-import https from 'https';
 import express from 'express';
 import path from 'path';
 import sqlite3 from 'sqlite3';
@@ -8,6 +7,7 @@ import multer from 'multer';
 import { scheduleRequest, getQueueStatus, shutdown as shutdownRateLimiter, isRateLimitingEnabled, getRateLimitConfig } from './rate-limit.js';
 import { getMetrics, recordRequest, recordLatency, recordTokenUsage, recordDroppedRequest, stopMetrics, areMetricsEnabled } from './metrics.js';
 import { isAllowlistEnabled, isEndpointAllowed, validateAndNormalizeRequest, getAllowlistStatus } from './allowlist.js';
+import { OpenAIHttpClient } from './http-client.js';
 
 // --- Path setup and config file locations ---
 const __filename = fileURLToPath(import.meta.url);
@@ -26,19 +26,42 @@ if (!fs.existsSync(KEYS_PATH)) {
   console.log('✅ Created default keys.json');
 }
 
-// --- Load OpenAI API key from config or env ---
-const OPENAI_HOST = 'api.openai.com';
+// --- Load configuration and initialize HTTP client ---
 let OPENAI_API_KEY = 'sk-...';
+let httpClientConfig = {};
 try {
   const configRaw = fs.readFileSync(CONFIG_PATH, 'utf-8');
   const config = JSON.parse(configRaw);
   if (config.OPENAI_API_KEY) {
     OPENAI_API_KEY = config.OPENAI_API_KEY;
   }
+  
+  // Load HTTP client configuration
+  if (config.HTTP_CLIENT) {
+    httpClientConfig = config.HTTP_CLIENT;
+  }
 } catch (err) {
   console.warn('⚠️ Could not load config.json or OPENAI_API_KEY not set. Using default or environment variable.');
   OPENAI_API_KEY = process.env.OPENAI_API_KEY || OPENAI_API_KEY;
 }
+
+// Initialize HTTP client (can be overridden for testing)
+let httpClient = null;
+
+function createHttpClient(customConfig = {}) {
+  const clientConfig = {
+    host: 'api.openai.com',
+    apiKey: OPENAI_API_KEY,
+    timeout: 120000,
+    maxRetries: 3,
+    ...httpClientConfig,
+    ...customConfig
+  };
+  return new OpenAIHttpClient(clientConfig);
+}
+
+// Create default HTTP client
+httpClient = createHttpClient();
 
 let VALID_KEYS = new Map();
 
@@ -246,10 +269,18 @@ app.use(async (req, res) => {
               recordLatency(req.method, req.url, 400, responseTime);
               return res.status(400).json({ error: `Failed to parse multipart data: ${err.message}` });
             }
-            handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime);
+            // Handle multipart in async wrapper
+            (async () => {
+              await handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime);
+            })().catch(error => {
+              console.error('Error in multipart handler:', error);
+              if (!res.headersSent) {
+                res.status(500).json({ error: 'Internal server error' });
+              }
+            });
           });
         } else {
-          handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime);
+          await handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime);
         }
     };
 
@@ -280,7 +311,7 @@ app.use(async (req, res) => {
   }
 });
 
-function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime) {
+async function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime) {
   // Utility: Redact base64 image data in request body for logging, but log a short prefix for traceability
   function redactBase64Images(obj) {
     if (Array.isArray(obj)) {
@@ -348,116 +379,100 @@ function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTime) {
   const logLine = `[${timestamp}] ✅ ${user.name} <${user.email}> from ${ip} → ${req.method} ${req.url} | body: ${redactedBodyString}`;
   fs.writeFileSync(LOG_PATH, logLine + '\n', { flag: 'a' });
 
-  console.log(`[DEBUG] Forwarding request to OpenAI: https://${OPENAI_HOST}${req.url}`);
+  console.log(`[DEBUG] Forwarding request to OpenAI via HTTP client: ${req.url}`);
   console.log(`[DEBUG] Request size: ${Buffer.byteLength(bodyBuffer)} bytes`);
   
-  const proxyReq = https.request({
-    hostname: OPENAI_HOST,
-    path: req.url,
-    method: req.method,
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(bodyBuffer)
-    },
-    timeout: 120000, // 2 minutes for complex requests
-    family: 4 // Force IPv4
-  }, proxyRes => {
-    const responseChunks = [];
-    console.log(`[DEBUG] OpenAI responded with status: ${proxyRes.statusCode}`);
-    proxyRes.on('data', chunk => {
-      responseChunks.push(chunk);
-      console.log(`[DEBUG] Received data chunk from OpenAI (${chunk.length} bytes)`);
-    });
-    proxyRes.on('end', () => {
-      const buffer = Buffer.concat(responseChunks);
-      const responseTime = Date.now() - startTime;
-      const responseTimeSeconds = responseTime / 1000;
-      console.log(`[DEBUG] Request completed in ${responseTime}ms`);
-      
-      // Record request metrics
-      recordRequest(req.method, req.url, proxyRes.statusCode, userKey);
-      recordLatency(req.method, req.url, proxyRes.statusCode, responseTimeSeconds);
-      
-      const contentType = proxyRes.headers['content-type'] || '';
-      if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
-        // Handle as text/JSON
-        const raw = buffer.toString();
-        console.log(`[DEBUG] Full response from OpenAI:`, raw);
-        try {
-          const json = JSON.parse(raw);
-          const usage = json.usage || {};
-          const model = json.model || 'unknown';
-          const prompt = usage.prompt_tokens || 0;
-          const completion = usage.completion_tokens || 0;
-          const total = prompt + completion;
-
-          // Record token usage metrics
-          if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
-          if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
-          if (total > 0) recordTokenUsage('total', model, userKey, total);
-
-          const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
-          console.log(usageLine);
-          fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
-
-          logToDB(userKey, model, req.url, prompt, completion);
-        } catch (err) {
-          console.error('⚠️ Failed to parse OpenAI response:', err.message);
-        }
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        res.end(raw);
-      } else {
-        // Binary data: forward as-is
-        console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${buffer.length}`);
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        res.end(buffer);
-      }
-    });
-  });
-
-  proxyReq.on('timeout', () => {
-    console.error('⏰ OpenAI request timed out after 2 minutes');
-    const responseTime = (Date.now() - startTime) / 1000;
-    recordRequest(req.method, req.url, 504, userKey);
-    recordLatency(req.method, req.url, 504, responseTime);
-    proxyReq.destroy();
-    if (!res.headersSent) {
-      res.statusCode = 504;
-      res.end('OpenAI request timed out');
-    }
-  });
-
-  proxyReq.on('socket', (socket) => {
-    console.log(`[DEBUG] Socket assigned, connecting to ${OPENAI_HOST}`);
-    socket.on('connect', () => {
-      console.log(`[DEBUG] Socket connected to ${OPENAI_HOST}`);
-    });
-  });
-
-  proxyReq.on('error', err => {
-    console.error('💥 Proxy error:', err.message);
-    console.error('💥 Error details:', {
-      code: err.code,
-      errno: err.errno,
-      syscall: err.syscall,
-      hostname: err.hostname,
-      port: err.port
-    });
-    const responseTime = (Date.now() - startTime) / 1000;
-    recordRequest(req.method, req.url, 502, userKey);
-    recordLatency(req.method, req.url, 502, responseTime);
-    if (!res.headersSent) {
-      res.statusCode = 502;
-      res.end('Bad Gateway');
-    }
-  });
-
-  proxyReq.write(bodyBuffer);
-  proxyReq.end();
+  // Use the HTTP client with retry and backoff
+  await handleJsonRequestWithClient(httpClient, req, res, normalizedBody, user, userKey, timestamp, startTime);
 }
 
-function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime) {
+async function handleJsonRequestWithClient(client, req, res, requestBody, user, userKey, timestamp, startTime) {
+  try {
+    const response = await client.makeJsonRequest(req.url, requestBody);
+    const responseTime = Date.now() - startTime;
+    const responseTimeSeconds = responseTime / 1000;
+    
+    console.log(`[DEBUG] Request completed in ${responseTime}ms with status: ${response.statusCode}`);
+    
+    // Record request metrics
+    recordRequest(req.method, req.url, response.statusCode, userKey);
+    recordLatency(req.method, req.url, response.statusCode, responseTimeSeconds);
+    
+    const contentType = response.headers['content-type'] || '';
+    if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
+      // Handle as text/JSON
+      const responseText = response.text;
+      console.log(`[DEBUG] Response from OpenAI:`, responseText);
+      
+      try {
+        const json = response.json();
+        const usage = json.usage || {};
+        const model = json.model || 'unknown';
+        const prompt = usage.prompt_tokens || 0;
+        const completion = usage.completion_tokens || 0;
+        const total = prompt + completion;
+
+        // Record token usage metrics
+        if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
+        if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
+        if (total > 0) recordTokenUsage('total', model, userKey, total);
+
+        const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
+        console.log(usageLine);
+        fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
+
+        logToDB(userKey, model, req.url, prompt, completion);
+      } catch (err) {
+        console.error('⚠️ Failed to parse OpenAI response:', err.message);
+      }
+      
+      res.writeHead(response.statusCode, response.headers);
+      res.end(responseText);
+    } else {
+      // Binary data: forward as-is
+      console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${response.data.length}`);
+      res.writeHead(response.statusCode, response.headers);
+      res.end(response.data);
+    }
+    
+  } catch (error) {
+    console.error('💥 HTTP Client error:', error.message);
+    console.error('💥 Error details:', {
+      statusCode: error.statusCode,
+      code: error.code,
+      response: error.response ? 'Present' : 'None'
+    });
+    
+    const responseTime = (Date.now() - startTime) / 1000;
+    const statusCode = error.statusCode || 502;
+    
+    recordRequest(req.method, req.url, statusCode, userKey);
+    recordLatency(req.method, req.url, statusCode, responseTime);
+    
+    if (!res.headersSent) {
+      if (error.statusCode && error.response) {
+        // Forward OpenAI error response
+        try {
+          const errorResponse = error.details || { error: { message: error.message } };
+          res.status(error.statusCode).json(errorResponse);
+        } catch (e) {
+          res.status(error.statusCode).end(error.response.text);
+        }
+      } else {
+        // Network or other error
+        res.status(502).json({ 
+          error: { 
+            message: 'Failed to connect to OpenAI', 
+            type: 'network_error',
+            code: error.code 
+          } 
+        });
+      }
+    }
+  }
+}
+
+async function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTime) {
   const uploadedFiles = req.files || [];
   
   // Cleanup function to remove temporary files
@@ -485,10 +500,10 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTim
   })));
 
   // Validate model if allowlist is enabled
-  if (allowlist.getAllowlistStatus().enabled) {
+  if (isAllowlistEnabled()) {
     if (req.body && req.body.model) {
       try {
-        const validation = allowlist.validateAndNormalizeRequest(req.body);
+        const validation = validateAndNormalizeRequest(req.body);
         if (!validation.valid) {
           cleanupFiles();
           console.log(`❌ Model not allowed: ${req.body.model} (user: ${user.name})`);
@@ -547,99 +562,10 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTim
     const logLine = `[${timestamp}] ✅ ${user.name} <${user.email}> from ${ip} → ${req.method} ${req.url} | multipart: ${JSON.stringify(logData)}`;
     fs.writeFileSync(LOG_PATH, logLine + '\n', { flag: 'a' });
 
-    console.log(`[DEBUG] Forwarding multipart request to OpenAI: https://${OPENAI_HOST}${req.url}`);
-    const proxyReq = https.request({
-      hostname: OPENAI_HOST,
-      path: req.url,
-      method: req.method,
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': Buffer.byteLength(bodyBuffer)
-      },
-      timeout: 30000, // Longer timeout for audio processing
-      family: 4
-    }, proxyRes => {
-      const responseChunks = [];
-      console.log(`[DEBUG] OpenAI responded with status: ${proxyRes.statusCode}`);
-      proxyRes.on('data', chunk => {
-        responseChunks.push(chunk);
-        console.log(`[DEBUG] Received data chunk from OpenAI (${chunk.length} bytes)`);
-      });
-      proxyRes.on('end', () => {
-        // Cleanup temp files after successful response
-        cleanupFiles();
-        
-        const buffer = Buffer.concat(responseChunks);
-        const responseTime = Date.now() - startTime;
-        const responseTimeSeconds = responseTime / 1000;
-        
-        // Record request metrics
-        recordRequest(req.method, req.url, proxyRes.statusCode, userKey);
-        recordLatency(req.method, req.url, proxyRes.statusCode, responseTimeSeconds);
-        
-        const contentType = proxyRes.headers['content-type'] || '';
-        if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
-          // Handle as text/JSON
-          const raw = buffer.toString();
-          console.log(`[DEBUG] Full response from OpenAI:`, raw);
-          try {
-            const json = JSON.parse(raw);
-            // Audio endpoints may not have usage data, but log if available
-            const usage = json.usage || {};
-            const model = req.body?.model || 'unknown';
-            const prompt = usage.prompt_tokens || 0;
-            const completion = usage.completion_tokens || 0;
-            const total = prompt + completion;
-
-            if (total > 0) {
-              // Record token usage metrics
-              if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
-              if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
-              if (total > 0) recordTokenUsage('total', model, userKey, total);
-
-              const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
-              console.log(usageLine);
-              fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
-              logToDB(userKey, model, req.url, prompt, completion);
-            }
-          } catch (err) {
-            console.error('⚠️ Failed to parse OpenAI response:', err.message);
-          }
-          res.writeHead(proxyRes.statusCode, proxyRes.headers);
-          res.end(raw);
-        } else {
-          // Binary data: forward as-is
-          console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${buffer.length}`);
-          res.writeHead(proxyRes.statusCode, proxyRes.headers);
-          res.end(buffer);
-        }
-      });
-    });
-
-    proxyReq.on('timeout', () => {
-      console.error('⏰ OpenAI request timed out after 30 seconds');
-      const responseTime = (Date.now() - startTime) / 1000;
-      recordRequest(req.method, req.url, 504, userKey);
-      recordLatency(req.method, req.url, 504, responseTime);
-      cleanupFiles(); // Cleanup on timeout
-      proxyReq.destroy();
-      res.statusCode = 504;
-      res.end('OpenAI request timed out');
-    });
-
-    proxyReq.on('error', err => {
-      console.error('💥 Proxy error:', err.message);
-      const responseTime = (Date.now() - startTime) / 1000;
-      recordRequest(req.method, req.url, 502, userKey);
-      recordLatency(req.method, req.url, 502, responseTime);
-      cleanupFiles(); // Cleanup on error
-      res.statusCode = 502;
-      res.end('Bad Gateway');
-    });
-
-    proxyReq.write(bodyBuffer);
-    proxyReq.end();
+    console.log(`[DEBUG] Forwarding multipart request to OpenAI via HTTP client: ${req.url}`);
+    
+    // Use the HTTP client with retry and backoff
+    await handleMultipartRequestWithClient(httpClient, req, res, bodyBuffer, boundary, user, userKey, timestamp, startTime, cleanupFiles);
     
   } catch (err) {
     console.error('💥 Error processing multipart request:', err.message);
@@ -648,6 +574,101 @@ function handleMultipartRequest(req, res, user, userKey, timestamp, ip, startTim
     recordLatency(req.method, req.url, 500, responseTime);
     cleanupFiles(); // Cleanup on processing error
     res.status(500).json({ error: 'Internal server error processing upload' });
+  }
+}
+
+async function handleMultipartRequestWithClient(client, req, res, bodyBuffer, boundary, user, userKey, timestamp, startTime, cleanupFiles) {
+  try {
+    const response = await client.makeMultipartRequest(req.url, bodyBuffer, boundary);
+    
+    // Cleanup temp files after successful response
+    cleanupFiles();
+    
+    const responseTime = Date.now() - startTime;
+    const responseTimeSeconds = responseTime / 1000;
+    
+    console.log(`[DEBUG] Multipart request completed in ${responseTime}ms with status: ${response.statusCode}`);
+    
+    // Record request metrics
+    recordRequest(req.method, req.url, response.statusCode, userKey);
+    recordLatency(req.method, req.url, response.statusCode, responseTimeSeconds);
+    
+    const contentType = response.headers['content-type'] || '';
+    if (contentType.startsWith('application/json') || contentType.startsWith('text/')) {
+      // Handle as text/JSON
+      const responseText = response.text;
+      console.log(`[DEBUG] Response from OpenAI:`, responseText);
+      
+      try {
+        const json = response.json();
+        // Audio endpoints may not have usage data, but log if available
+        const usage = json.usage || {};
+        const model = req.body?.model || 'unknown';
+        const prompt = usage.prompt_tokens || 0;
+        const completion = usage.completion_tokens || 0;
+        const total = prompt + completion;
+
+        if (total > 0) {
+          // Record token usage metrics
+          if (prompt > 0) recordTokenUsage('prompt', model, userKey, prompt);
+          if (completion > 0) recordTokenUsage('completion', model, userKey, completion);
+          if (total > 0) recordTokenUsage('total', model, userKey, total);
+
+          const usageLine = `[${timestamp}] 📊 ${user.name} used ${total} tokens (${prompt}+${completion}) on ${model}`;
+          console.log(usageLine);
+          fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
+          logToDB(userKey, model, req.url, prompt, completion);
+        }
+      } catch (err) {
+        console.error('⚠️ Failed to parse OpenAI response:', err.message);
+      }
+      
+      res.writeHead(response.statusCode, response.headers);
+      res.end(responseText);
+    } else {
+      // Binary data: forward as-is
+      console.log(`[DEBUG] Binary response from OpenAI, content-type: ${contentType}, length: ${response.data.length}`);
+      res.writeHead(response.statusCode, response.headers);
+      res.end(response.data);
+    }
+    
+  } catch (error) {
+    console.error('💥 HTTP Client error in multipart request:', error.message);
+    console.error('💥 Error details:', {
+      statusCode: error.statusCode,
+      code: error.code,
+      response: error.response ? 'Present' : 'None'
+    });
+    
+    const responseTime = (Date.now() - startTime) / 1000;
+    const statusCode = error.statusCode || 502;
+    
+    recordRequest(req.method, req.url, statusCode, userKey);
+    recordLatency(req.method, req.url, statusCode, responseTime);
+    
+    // Always cleanup on error
+    cleanupFiles();
+    
+    if (!res.headersSent) {
+      if (error.statusCode && error.response) {
+        // Forward OpenAI error response
+        try {
+          const errorResponse = error.details || { error: { message: error.message } };
+          res.status(error.statusCode).json(errorResponse);
+        } catch (e) {
+          res.status(error.statusCode).end(error.response.text);
+        }
+      } else {
+        // Network or other error
+        res.status(502).json({ 
+          error: { 
+            message: 'Failed to connect to OpenAI', 
+            type: 'network_error',
+            code: error.code 
+          } 
+        });
+      }
+    }
   }
 }
 
@@ -763,6 +784,17 @@ process.on('SIGTERM', async () => {
   }
   process.exit(0);
 });
+
+// Export functions for testing
+export function setHttpClient(client) { 
+  httpClient = client; 
+}
+
+export function getHttpClient() { 
+  return httpClient; 
+}
+
+export { createHttpClient };
 
 app.listen(8080, () => {
   console.log('🚀 OpenAI Proxy running on http://localhost:8080');

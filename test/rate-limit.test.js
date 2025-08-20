@@ -54,9 +54,9 @@ function makePublicRequest(endpoint = '/health', method = 'GET') {
 // Helper to make a request with a specific API key (with delay simulation for testing concurrency)
 function makeRequest(apiKey, endpoint = '/v1/chat/completions', body = null, simulateDelay = false) {
   const requestBody = body || {
-    model: 'gpt-4o-mini',
+    model: 'gpt-5-mini',
     messages: [{ role: 'user', content: 'Hello' }],
-    max_tokens: simulateDelay ? 100 : 10  // More tokens = longer processing time
+    max_completion_tokens: simulateDelay ? 100 : 10  // More tokens = longer processing time
   };
 
   const data = JSON.stringify(requestBody);

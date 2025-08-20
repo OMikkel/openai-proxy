@@ -70,9 +70,9 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
   describe('Chat Completion API', function() {
     it('should handle basic chat completion requests', async function() {
       const requestData = JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: [{ role: 'user', content: 'Say "Hello, proxy test!"' }],
-        max_tokens: 20
+        max_completion_tokens: 20
       });
       
       const options = {
@@ -96,7 +96,7 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
       expect(json.choices.length).to.be.greaterThan(0);
       expect(json.usage).to.exist;
       expect(json.usage.total_tokens).to.be.greaterThan(0);
-      expect(json.model).to.match(/^gpt-4o-mini/);
+      expect(json.model).to.match(/^gpt-5-mini/);
     });
 
     it('should handle vision API requests', async function() {
@@ -104,7 +104,7 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
       const base64Image = pngData.toString('base64');
       
       const requestData = JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: [{
           role: 'user',
           content: [
@@ -115,7 +115,7 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
             }
           ]
         }],
-        max_tokens: 50
+        max_completion_tokens: 50
       });
       
       const options = {
@@ -235,9 +235,9 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
   describe('Security & Authentication', function() {
     it('should reject requests with invalid API keys', async function() {
       const requestData = JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: [{ role: 'user', content: 'Test' }],
-        max_tokens: 10
+        max_completion_tokens: 10
       });
       
       const options = {
@@ -300,9 +300,9 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
   describe('Rate Limiting', function() {
     it('should handle moderate load without errors', async function() {
       const requestData = JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: [{ role: 'user', content: 'Quick test' }],
-        max_tokens: 10
+        max_completion_tokens: 10
       });
       
       const options = {
@@ -340,9 +340,9 @@ describe('OpenAI Proxy Comprehensive Tests', function() {
       this.timeout(120000); // 2 minute timeout for high volume test
       
       const requestData = JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'gpt-5-mini',
         messages: [{ role: 'user', content: 'Hi' }],
-        max_tokens: 5
+        max_completion_tokens: 5
       });
       
       const options = {

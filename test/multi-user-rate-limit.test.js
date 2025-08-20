@@ -17,9 +17,9 @@ const TEST_KEYS = [
 // Helper to make a request with a specific API key
 function makeRequest(apiKey, endpoint = '/v1/chat/completions', body = null) {
   const requestBody = body || {
-    model: 'gpt-4o-mini',
+    model: 'gpt-5-mini',
     messages: [{ role: 'user', content: 'Hello' }],
-    max_tokens: 10
+    max_completion_tokens: 10
   };
 
   const data = JSON.stringify(requestBody);
