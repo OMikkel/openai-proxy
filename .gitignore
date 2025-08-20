@@ -9,3 +9,5 @@ temp-uploads/
 package-lock.json
 .DS_Store
 students.csv
+hardening.md
+package-lock.json
