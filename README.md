@@ -6,6 +6,7 @@ This is a proxy for OpenAI's API with with own API key management. It is designe
 
 - **API Key Management**: Restrict access to the proxy using per-user API keys stored in `keys.json` (hot-reloads on change).
 - **Rate Limiting**: Comprehensive rate limiting with per-user and global limits, automatic queuing, and overflow protection.
+- **Robust HTTP Client**: Built-in retry logic with exponential backoff, idempotency keys, and intelligent error handling for OpenAI API requests.
 - **Usage Logging**: All usage is logged to a local SQLite database (`usage.sqlite`) for reporting and auditing.
 - **Access Logging**: All requests are logged to `access.log` (with sensitive data redacted).
 - **OpenAI API Forwarding**: Forwards requests to OpenAI's API, adding your configured API key.
@@ -120,6 +121,10 @@ The proxy includes comprehensive test suites to verify functionality:
   ```sh
   npm run test:enforcement
   ```
+- **HTTP Client Tests**: Retry and backoff logic testing with mock transport
+  ```sh
+  npm run test test/retry-backoff-fixed.test.js
+  ```
 
 ### **Test Configuration**
 Tests use the API keys defined in `keys.json`. For rate limiting tests, ensure you have test keys configured or the tests will use default test keys.
@@ -139,6 +144,7 @@ Tests use the API keys defined in `keys.json`. For rate limiting tests, ensure y
 - `config.json` — OpenAI API key and configuration (gitignored)
 - `usage.sqlite` — Usage database (gitignored)
 - `access.log` — Access log (gitignored)
+- `http-client.js` — HTTP client with retry logic and error handling
 - `test/` — Test suites for comprehensive functionality verification
 
 ## Scaling & Cleanup
@@ -207,6 +213,12 @@ Rate limiting is configured in `config.json` under the `RATE_LIMITING` section:
 - **Upload Limits**: Max 10 concurrent uploads per user (prevents resource exhaustion)
 - **File Limits**: Max 5 files per request, 50MB per file
 - **File Type Validation**: Only allows audio formats for audio endpoints
+
+#### **HTTP Client Reliability**
+- **Retry Logic**: Automatic retry with exponential backoff for rate limits (429) and server errors (5xx)
+- **Idempotency**: Automatic idempotency key generation for safe retries
+- **Error Classification**: Intelligent handling of retryable vs non-retryable errors
+- **Configurable Timeouts**: Request timeout management (default: 120s)
 
 ### **Log Management**
 - **Log Rotation**: Automatically rotates `access.log` when it exceeds 100MB
