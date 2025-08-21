@@ -25,6 +25,8 @@
     ],
     "models": [
       "gpt-5-mini",
+      "gpt-4o",
+      "whisper-1",
       "text-embedding-3-small",
       "tts-1",
       "tts-1-hd"

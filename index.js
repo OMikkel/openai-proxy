@@ -382,8 +382,130 @@ async function handleJsonRequest(req, res, user, userKey, timestamp, ip, startTi
   console.log(`[DEBUG] Forwarding request to OpenAI via HTTP client: ${req.url}`);
   console.log(`[DEBUG] Request size: ${Buffer.byteLength(bodyBuffer)} bytes`);
   
-  // Use the HTTP client with retry and backoff
-  await handleJsonRequestWithClient(httpClient, req, res, normalizedBody, user, userKey, timestamp, startTime);
+  // Check if this is a streaming request
+  if (normalizedBody.stream === true) {
+    console.log(`[DEBUG] Streaming request detected`);
+    await handleStreamingRequestWithClient(httpClient, req, res, normalizedBody, user, userKey, timestamp, startTime);
+  } else {
+    // Use the HTTP client with retry and backoff
+    await handleJsonRequestWithClient(httpClient, req, res, normalizedBody, user, userKey, timestamp, startTime);
+  }
+}
+
+async function handleStreamingRequestWithClient(client, req, res, requestBody, user, userKey, timestamp, startTime) {
+  try {
+    const response = await client.makeStreamingRequest(req.url, requestBody);
+    const responseTime = Date.now() - startTime;
+    const responseTimeSeconds = responseTime / 1000;
+    
+    console.log(`[DEBUG] Streaming request initiated with status: ${response.statusCode}`);
+    
+    // Record request metrics
+    recordRequest(req.method, req.url, response.statusCode, userKey);
+    recordLatency(req.method, req.url, response.statusCode, responseTimeSeconds);
+    
+    if (response.statusCode >= 400) {
+      // Handle error response
+      const chunks = [];
+      response.stream.on('data', chunk => chunks.push(chunk));
+      response.stream.on('end', () => {
+        const errorBody = Buffer.concat(chunks).toString();
+        console.error('💥 Streaming request failed:', errorBody);
+        
+        if (!res.headersSent) {
+          res.writeHead(response.statusCode, response.headers);
+          res.end(errorBody);
+        }
+      });
+      return;
+    }
+    
+    // Set up SSE headers for streaming
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'X-Accel-Buffering': 'no' // Disable Nginx buffering
+    });
+    
+    // Variables to track usage
+    let totalTokens = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let model = requestBody.model || 'unknown';
+    
+    // Pipe the stream directly to the client
+    response.stream.on('data', (chunk) => {
+      // Forward the chunk to the client
+      res.write(chunk);
+      
+      // Try to extract usage information from SSE data
+      const chunkStr = chunk.toString();
+      const lines = chunkStr.split('\n');
+      
+      for (const line of lines) {
+        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+          try {
+            const data = JSON.parse(line.substring(6));
+            if (data.usage) {
+              promptTokens = data.usage.prompt_tokens || promptTokens;
+              completionTokens = data.usage.completion_tokens || completionTokens;
+              totalTokens = data.usage.total_tokens || totalTokens;
+            }
+            if (data.model) {
+              model = data.model;
+            }
+          } catch (e) {
+            // Ignore parsing errors for incomplete chunks
+          }
+        }
+      }
+    });
+    
+    response.stream.on('end', () => {
+      // Log usage if we collected any
+      if (totalTokens > 0) {
+        // Record token usage metrics
+        if (promptTokens > 0) recordTokenUsage('prompt', model, userKey, promptTokens);
+        if (completionTokens > 0) recordTokenUsage('completion', model, userKey, completionTokens);
+        if (totalTokens > 0) recordTokenUsage('total', model, userKey, totalTokens);
+
+        const usageLine = `[${timestamp}] 📊 ${user.name} used ${totalTokens} tokens (${promptTokens}+${completionTokens}) on ${model} [streaming]`;
+        console.log(usageLine);
+        fs.writeFileSync(LOG_PATH, usageLine + '\n', { flag: 'a' });
+
+        logToDB(userKey, model, req.url, promptTokens, completionTokens);
+      }
+      
+      res.end();
+    });
+    
+    response.stream.on('error', (error) => {
+      console.error('💥 Stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream error' });
+      }
+    });
+    
+  } catch (error) {
+    console.error('💥 Streaming error:', error.message);
+    const responseTime = (Date.now() - startTime) / 1000;
+    const statusCode = error.statusCode || 502;
+    
+    recordRequest(req.method, req.url, statusCode, userKey);
+    recordLatency(req.method, req.url, statusCode, responseTime);
+    
+    if (!res.headersSent) {
+      res.status(statusCode).json({
+        error: {
+          message: error.message,
+          type: 'streaming_error',
+          details: error.details
+        }
+      });
+    }
+  }
 }
 
 async function handleJsonRequestWithClient(client, req, res, requestBody, user, userKey, timestamp, startTime) {

@@ -248,6 +248,61 @@ class OpenAIHttpClient {
   }
 
   /**
+   * Make a streaming request to OpenAI
+   * Returns the raw response object for streaming
+   */
+  async makeStreamingRequest(path, data, options = {}) {
+    const requestOptions = {
+      hostname: this.host,
+      path: path,
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(JSON.stringify(data)),
+        ...options.headers
+      },
+      timeout: options.timeout || this.timeout,
+      family: 4 // Force IPv4
+    };
+
+    // Add idempotency key for retryable requests
+    if (this.enableIdempotency && ['POST', 'PUT', 'PATCH'].includes(requestOptions.method)) {
+      if (!requestOptions.headers['Idempotency-Key']) {
+        requestOptions.headers['Idempotency-Key'] = this.generateIdempotencyKey();
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(requestOptions, (res) => {
+        // For streaming, we immediately resolve with the response object
+        // Don't buffer the response
+        resolve({
+          statusCode: res.statusCode,
+          statusText: res.statusMessage,
+          headers: res.headers,
+          stream: res // Return the raw stream
+        });
+      });
+
+      req.on('error', (error) => {
+        reject(error);
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        const timeoutError = new Error('Request timeout');
+        timeoutError.code = 'TIMEOUT';
+        reject(timeoutError);
+      });
+
+      // Send data
+      req.write(JSON.stringify(data));
+      req.end();
+    });
+  }
+
+  /**
    * Make a multipart request to OpenAI
    */
   async makeMultipartRequest(path, bodyBuffer, boundary, options = {}) {
