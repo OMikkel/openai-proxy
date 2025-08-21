@@ -57,12 +57,19 @@ if (!email) {
       const userMap = new Map(keys.map(k => [k.key, k]));
       // Sort by total tokens used (desc)
       rows.sort((a, b) => (b.total || 0) - (a.total || 0));
+      
+      // Calculate optimal column widths
+      const users = rows.map(row => userMap.get(row.api_key) || { name: 'Unknown', email: row.api_key });
+      const nameWidth = Math.max(4, ...users.map(u => u.name.length)) + 1; // +1 for padding
+      const emailWidth = Math.max(5, ...users.map(u => u.email.length)) + 1; // +1 for padding
+      
       // Table header
-      console.log(`Name                | Email                  | Prompts | Prompt tokens | Completion | Total tokens`);
-      console.log(`--------------------+------------------------+---------+--------------+------------+-------------`);
+      console.log(`${'Name'.padEnd(nameWidth)}| ${'Email'.padEnd(emailWidth)}| Prompts | Prompt tokens | Completion | Total tokens`);
+      console.log(`${'-'.repeat(nameWidth)}+${'-'.repeat(emailWidth + 1)}+---------+--------------+------------+-------------`);
+      
       for (const row of rows) {
         const user = userMap.get(row.api_key) || { name: 'Unknown', email: row.api_key };
-        console.log(`${user.name.padEnd(20)} | ${user.email.padEnd(22)} | ${String(row.prompts).padStart(7)} | ${String(row.prompt).padStart(12)} | ${String(row.completion).padStart(10)} | ${String(row.total).padStart(11)}`);
+        console.log(`${user.name.padEnd(nameWidth)}| ${user.email.padEnd(emailWidth)}| ${String(row.prompts).padStart(7)} | ${String(row.prompt).padStart(12)} | ${String(row.completion).padStart(10)} | ${String(row.total).padStart(11)}`);
       }
       db.close();
     }
